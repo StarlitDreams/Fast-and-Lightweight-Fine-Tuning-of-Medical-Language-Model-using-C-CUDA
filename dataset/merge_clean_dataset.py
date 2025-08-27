@@ -362,6 +362,48 @@ for f in panic_csvs:
         post = f"Patient data - {'; '.join(parts)}."
         task = "Is this a case of Panic Disorder? Answer Yes or No."
         all_lines.append(f"Post: {post}\nTask: {task}\nAnswer: {ans}<|endoftext|>")
+# 10) Reddit ADHD dataset — jerseyneo
+adhd_slug = "jerseyneo/reddit-adhd-dataset"
+adhd_dir = cache_dir / "reddit_adhd_dataset"
+download_kaggle_dataset(adhd_slug, adhd_dir)
+
+# This dataset typically contains multiple CSVs (e.g., ADHD.csv, ADHD-comment.csv, adhdwomen.csv, adhdwomen-comment.csv)
+adhd_csvs = sorted([p for p in adhd_dir.glob("*.csv")])
+if not adhd_csvs:
+    raise FileNotFoundError(f"No CSV files found for {adhd_slug}")
+
+print("[+] Processing ADHD CSVs (streaming)...")
+for csv_path in adhd_csvs:
+    print(f"    -> {csv_path.name}")
+    # Stream rows to avoid loading multi-million row files into memory at once
+    with csv_path.open('r', encoding='utf-8', errors='ignore') as f:
+        try:
+            sample = f.read(4096)
+            f.seek(0)
+            dialect = csv.Sniffer().sniff(sample)
+        except Exception:
+            dialect = csv.excel
+        reader = csv.DictReader(f, dialect=dialect)
+
+        for row in reader:
+            # Try common text fields for Reddit posts/comments
+            text = ""
+            for k in ("selftext", "body", "comment", "text", "content", "post", "message"):
+                v = row.get(k)
+                if v and str(v).strip():
+                    text = str(v)
+                    break
+            title = (row.get("title") or "").strip()
+            if title and title not in text:
+                text = f"{title}\n{text}" if text else title
+            text = text.strip()
+            if not text or len(text) < 20:
+                continue  # skip very short/empty entries
+
+            post = text.replace("\n", " ").strip()
+            task = "Identify which mental health condition this post is about."
+            answer = "ADHD"  # deterministic label since corpus is ADHD-focused
+            all_lines.append(f"Post: {post}\nTask: {task}\nAnswer: {answer}<|endoftext|>")
 
 # DSM-5 knowledge injection (optional)
 if args.include_dsm:
