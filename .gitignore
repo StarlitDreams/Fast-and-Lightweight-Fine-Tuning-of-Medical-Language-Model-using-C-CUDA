@@ -1,0 +1,25 @@
+# ignore all raw datasets and caches
+dataset/data/**
+data_cache/**
+
+# keep only final llm.c artifacts
+!dataset/data/training_data.bin
+!dataset/data/validation_data.bin
+!dataset/data/*.bin
+
+# globally ignore CSV/TXT anywhere in the repo
+*.csv
+*.txt
+
+# never commit Kaggle creds
+.kaggle/
+kaggle.json
+
+# misc
+runs/
+__pycache__/
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
