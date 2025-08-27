@@ -186,53 +186,151 @@ for row in read_csv_any(neel_file):
     task = "Identify the mental health issue discussed in this post (Stress, Depression, Bipolar, Anxiety, or PTSD)."
     all_lines.append(f"Post: {post}\nTask: {task}\nAnswer: {name}<|endoftext|>")
 
-# 6) Social Anxiety dataset (severity)
+# 6) Social Anxiety dataset — robust label discovery + binning
 sad_slug = "natezhang123/social-anxiety-dataset"
 sad_dir = cache_dir / "social_anxiety_dataset"
 download_kaggle_dataset(sad_slug, sad_dir)
-sad_file = next((f for f in sad_dir.glob("*") if f.suffix.lower() in (".csv",".xlsx")), None)
-if not sad_file:
-    raise FileNotFoundError(f"No CSV/XLSX for {sad_slug}")
-print(f"[+] Processing {sad_file.name}")
-if sad_file.suffix.lower() == ".csv":
-    sad_rows = read_csv_any(sad_file)
+
+# Prefer the known filename if present, else first CSV/XLSX
+preferred = sad_dir / "enhanced_anxiety_dataset.csv"
+if preferred.exists():
+    sad_file = preferred
 else:
-    try:
-        import pandas as pd
-    except ImportError:
-        raise RuntimeError("Pandas is required to read Excel (install pandas).")
-    sad_rows = pd.read_excel(sad_file).to_dict(orient="records")
-label_col = None
-if sad_rows:
-    for k in sad_rows[0].keys():
-        if k.lower() in ("severity","level","anxiety_level","class","label"):
-            label_col = k; break
-if not label_col:
-    raise RuntimeError("Could not find severity label in Social Anxiety dataset.")
-feat_keys = [k for k in sad_rows[0].keys() if k != label_col]
-chosen = []
-for fk in feat_keys:
-    lk = fk.lower()
-    if any(s in lk for s in ("anxiety","social","avoid","fear")):
-        chosen.append(fk)
-    if len(chosen) >= 3: break
-if not chosen: chosen = feat_keys[:3]
-for row in sad_rows:
-    sev = str(row.get(label_col,"")).strip()
-    if not sev: continue
-    if sev.isdigit():
-        sev = int(sev)
-        sev_text = "None" if sev<=0 else "Mild" if sev==1 else "Moderate" if sev==2 else "Severe"
+    sad_file = next((f for f in sad_dir.glob("*") if f.suffix.lower() in (".csv", ".xlsx")), None)
+if not sad_file:
+    print(f"[!] No CSV/XLSX for {sad_slug}; skipping.")
+else:
+    print(f"[+] Processing {sad_file.name}")
+
+    # Load rows (pandas only if xlsx)
+    if sad_file.suffix.lower() == ".csv":
+        sad_rows = read_csv_any(sad_file)
     else:
-        sev_text = sev.capitalize()
-    desc = []
-    for fk in chosen:
-        val = str(row.get(fk,"")).strip()
-        if val: desc.append(f"{fk}: {val}")
-    if not desc: continue
-    post = f"The individual reports: {'; '.join(desc)}."
-    task = "Classify the person's social anxiety level (None, Mild, Moderate, or Severe)."
-    all_lines.append(f"Post: {post}\nTask: {task}\nAnswer: {sev_text}<|endoftext|>")
+        try:
+            import pandas as pd
+        except ImportError:
+            raise RuntimeError("Pandas is required to read Excel (install pandas).")
+        sad_rows = pd.read_excel(sad_file).to_dict(orient="records")
+
+    if not sad_rows:
+        print("[!] Social Anxiety dataset is empty after parsing; skipping.")
+    else:
+        # ---- Infer label column ----
+        keys0 = list(sad_rows[0].keys())
+        def _norm(s): return s.lower().strip().replace(" ", "_")
+        norm_keys = {k: _norm(k) for k in keys0}
+
+        # Prefer columns that mention anxiety + (level|severity|score|class|label|category|status)
+        pri_terms = ("level","severity","score","class","label","category","status")
+        candidates = []
+        for k, nk in norm_keys.items():
+            if "anxiety" in nk and any(t in nk for t in pri_terms):
+                candidates.append(k)
+
+        # Fallback: any generic label-ish column
+        if not candidates:
+            for k, nk in norm_keys.items():
+                if any(t in nk for t in pri_terms):
+                    candidates.append(k)
+
+        label_col = candidates[0] if candidates else None
+        if not label_col:
+            print("[!] Could not infer a label column for Social Anxiety; skipping this dataset.")
+        else:
+            print(f"[info] Social Anxiety label column => {label_col}")
+
+            # Collect raw labels to decide how to map/bin
+            raw_vals = [str(r.get(label_col, "")).strip() for r in sad_rows if str(r.get(label_col, "")).strip() != ""]
+            # Decide numeric vs categorical
+            def _to_float(x):
+                try:
+                    return float(x)
+                except Exception:
+                    return None
+            numeric_vals = [v for v in (_to_float(x) for x in raw_vals) if v is not None]
+
+            # Build a mapper from raw -> {None,Mild,Moderate,Severe}
+            label_map = {}
+
+            if len(numeric_vals) >= max(50, int(0.2 * len(raw_vals))):
+                # Mostly numeric: bin into quartiles (handle ties/degenerate distributions)
+                arr = np.array(numeric_vals, dtype=float)
+                if np.allclose(arr.min(), arr.max()):
+                    # degenerate: every value same → call it Moderate
+                    label_map = {"__NUMERIC_DEFAULT__": "Moderate"}
+                    use_numeric_binning = "degenerate"
+                    q1 = q2 = q3 = arr.min()
+                else:
+                    q1, q2, q3 = np.quantile(arr, [0.25, 0.5, 0.75])
+                    use_numeric_binning = "quartiles"
+
+                def num2sev(x):
+                    if use_numeric_binning == "degenerate":
+                        return "Moderate"
+                    if x <= q1: return "None"
+                    elif x <= q2: return "Mild"
+                    elif x <= q3: return "Moderate"
+                    else: return "Severe"
+                print(f"[info] Numeric label detected; binning by {use_numeric_binning}.")
+            else:
+                # Categorical: normalize strings
+                def cat2sev(s):
+                    sl = s.lower()
+                    if sl in ("0","none","no","low","lowest","minimal"): return "None"
+                    if sl in ("1","mild","slight","light"): return "Mild"
+                    if sl in ("2","moderate","med","medium"): return "Moderate"
+                    if sl in ("3","severe","high","very high"): return "Severe"
+                    # Heuristics: map ordered words
+                    if "none" in sl: return "None"
+                    if "mild" in sl or "low" in sl: return "Mild"
+                    if "moderate" in sl or "mid" in sl: return "Moderate"
+                    if "severe" in sl or "high" in sl: return "Severe"
+                    # fallback default
+                    return "Moderate"
+                print("[info] Categorical label detected; normalizing to four levels.")
+
+            # ---- Choose a few readable features to surface in the text ----
+            # Prefer interpretable columns; exclude the label
+            feature_pool = [k for k in keys0 if k != label_col]
+            def feature_score(name: str):
+                n = _norm(name)
+                score = 0
+                for token in ("anxiety","social","avoid","fear","score","scale","confidence","interaction","sleep","caffeine","alcohol","exercise"):
+                    if token in n: score += 1
+                return score
+            feature_pool.sort(key=feature_score, reverse=True)
+            chosen_feats = feature_pool[:3] if feature_pool else []
+
+            # ---- Emit examples ----
+            for row in sad_rows:
+                raw_lab = row.get(label_col, None)
+                if raw_lab is None or str(raw_lab).strip() == "":
+                    continue
+                if numeric_vals:
+                    f = _to_float(raw_lab)
+                    if f is None:
+                        continue
+                    sev = num2sev(f)
+                else:
+                    sev = cat2sev(str(raw_lab))
+
+                # Build a short description from chosen features
+                desc = []
+                for fk in chosen_feats:
+                    if fk not in row: continue
+                    val = str(row.get(fk, "")).strip()
+                    if val == "" or val.lower() == "nan": continue
+                    desc.append(f"{fk}: {val}")
+                if not desc:
+                    # if nothing to show, craft a minimal statement
+                    desc_text = "various lifestyle and screening features available"
+                else:
+                    desc_text = "; ".join(desc)
+
+                post = f"The individual reports: {desc_text}."
+                task = "Classify the person's social anxiety level (None, Mild, Moderate, or Severe)."
+                all_lines.append(f"Post: {post}\nTask: {task}\nAnswer: {sev}<|endoftext|>")
+
 
 # 7) Entenam RMHD (condition + cause)
 entenam_slug = "entenam/reddit-mental-health-dataset"
