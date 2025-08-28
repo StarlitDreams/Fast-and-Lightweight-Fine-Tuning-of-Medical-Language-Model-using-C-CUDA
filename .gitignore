@@ -10,6 +10,8 @@ data_cache/**
 # globally ignore CSV/TXT anywhere in the repo
 *.csv
 *.txt
+*.rtf
+
 
 # never commit Kaggle creds
 .kaggle/
