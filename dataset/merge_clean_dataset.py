@@ -1,574 +1,672 @@
-import os, re, csv, argparse, random, unicodedata
-import numpy as np
-from pathlib import Path
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Merge mental-health datasets, clean & keywordize text, split into train/val,
+and write streaming GPT-2 token binaries for llm.c.
 
-# Optional deps (used if present)
+Datasets included:
+  - kamaruladha/mental-disorders-identification-reddit-nlp
+  - michellevp/mental-health-dataset-bipolar
+  - michellevp/predicting-anxiety-in-mental-health-data
+  - shuvojitdas/stress-analysis
+  - neelghoshal/reddit-mental-health-data
+  - natezhang123/social-anxiety-dataset
+  - entenam/reddit-mental-health-dataset  (recursive loader)
+  - cid007/mental-disorder-classification
+  - muhammadshahidazeem/panic-disorder-detection-dataset
+  - jerseyneo/reddit-adhd-dataset
+
+Outputs:
+  --train-out  (text) + .bin
+  --val-out    (text) + .bin
+"""
+
+import os
+import sys
+import csv
+import re
+import math
+import json
+import argparse
+import hashlib
+from pathlib import Path
+import random
+import numpy as np
+
+# Optional libs
+try:
+    from transformers import GPT2TokenizerFast
+except ImportError:
+    GPT2TokenizerFast = None
+
+try:
+    from better_profanity import profanity as _bp
+except ImportError:
+    _bp = None
+
 try:
     import pandas as pd
 except Exception:
     pd = None
 
 try:
-    from transformers import GPT2TokenizerFast
+    import spacy
+    _spacy_nlp = None
 except Exception:
-    GPT2TokenizerFast = None
+    _spacy_nlp = None
 
-# ----------------------------
+
+# ---------------------------
 # CLI
-# ----------------------------
-p = argparse.ArgumentParser("Merge & clean mental-health datasets + DSM validation + streaming tokenization")
-p.add_argument("--train-out", type=str, required=True)
-p.add_argument("--val-out",   type=str, required=True)
-p.add_argument("--val-ratio", type=float, default=0.10)
-p.add_argument("--include-dsm", action="store_true", help="also inject DSM-5 Q&A from --dsm-file")
-p.add_argument("--dsm-file", type=str, default="DSM-5.txt")
-p.add_argument("--dsm-validate", type=str, choices=["off","soft","strict"], default="soft",
-               help="validate disorder-labeled items via DSM-5 keywords")
-p.add_argument("--rejects-out", type=str, default="dataset/data/cleaning_rejects.csv")
-p.add_argument("--min-words", type=int, default=5)
-p.add_argument("--max-words", type=int, default=400)
-p.add_argument("--profanity-file", type=str, default="")
-p.add_argument("--seed", type=int, default=42)
-p.add_argument("--no-shuffle", action="store_true")
-args = p.parse_args()
+# ---------------------------
+parser = argparse.ArgumentParser(description="Merge & clean mental-health datasets → train/val .txt + .bin")
+parser.add_argument('--train-out', type=str, default='dataset/data/training_data.txt')
+parser.add_argument('--val-out',   type=str, default='dataset/data/validation_data.txt')
+parser.add_argument('--val-ratio', type=float, default=0.10, help='Fraction routed to validation set (approx).')
+parser.add_argument('--seed',      type=int, default=42)
+parser.add_argument('--include-dsm', action='store_true', help='Inject DSM-5 knowledge Q&A from --dsm-file.')
+parser.add_argument('--dsm-file',  type=str, default='dataset/DSM-5.txt')
 
-# ----------------------------
-# Paths & Helpers
-# ----------------------------
-train_out = Path(args.train_out)
-val_out   = Path(args.val_out)
-train_out.parent.mkdir(parents=True, exist_ok=True)
-val_out.parent.mkdir(parents=True, exist_ok=True)
-rejects_out = Path(args.rejects_out)
-rejects_out.parent.mkdir(parents=True, exist_ok=True)
+# cleaning / keywordization
+parser.add_argument('--keywordize', choices=['simple', 'spacy'], default='simple',
+                    help="Reduce posts to keywords: 'simple' (fast) or 'spacy' (lemma+POS).")
+parser.add_argument('--strip-profanity', choices=['on','off'], default='on',
+                    help="Remove profane tokens (custom list + better_profanity if installed).")
+parser.add_argument('--profanity-file', type=str, default=None, help="Path to custom profanity/stop list (one word per line).")
+parser.add_argument('--strip-emojis', choices=['on','off'], default='on', help="Remove emoji/pictographs.")
+parser.add_argument('--unique-keywords', choices=['on','off'], default='on', help="Make tokens set-unique per post.")
+parser.add_argument('--min-chars', type=int, default=20, help='Min raw characters before cleaning.')
+parser.add_argument('--min-kw', type=int, default=3, help='Min keyword count after keywordization.')
 
-cache_dir = Path("data_cache"); cache_dir.mkdir(exist_ok=True)
+# dedupe & spam heuristics
+parser.add_argument('--dedupe-cap', type=int, default=1_000_000, help='Max items to track for dedupe (memory cap).')
+parser.add_argument('--rmhd-seen-cap', type=int, default=500_000, help='Light dedupe cap for RMHD.')
+parser.add_argument('--skip-rmhd', action='store_true', help='Skip Entenam RMHD if you want to limit volume.')
 
-def download_kaggle_dataset(dataset_slug: str, dest_dir: Path):
-    if dest_dir.exists() and any(dest_dir.iterdir()):
-        print(f"[+] {dataset_slug} already downloaded in {dest_dir}")
+args = parser.parse_args()
+random.seed(args.seed)
+
+# ---------------------------
+# Paths & setup
+# ---------------------------
+cache_dir = Path("data_cache"); cache_dir.mkdir(exist_ok=True, parents=True)
+train_path = Path(args.train_out); train_path.parent.mkdir(parents=True, exist_ok=True)
+val_path   = Path(args.val_out);   val_path.parent.mkdir(parents=True, exist_ok=True)
+
+print(f"[ok] train={train_path} | val={val_path}")
+
+# ---------------------------
+# Kaggle download helper
+# ---------------------------
+def kaggle_download(slug: str, dest: Path):
+    if dest.exists() and any(dest.iterdir()):
+        print(f"[+] {slug} already downloaded in {dest}")
         return
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[-] Downloading {dataset_slug} ...")
-    ret = os.system(f'kaggle datasets download -d {dataset_slug} -p "{dest_dir}" --quiet --unzip')
-    if ret != 0:
-        raise RuntimeError(f"Failed to download {dataset_slug}. Is Kaggle API configured?")
+    dest.mkdir(parents=True, exist_ok=True)
+    print(f"[-] Downloading {slug} ...")
+    # quiet unzip + show meta in console (kaggle CLI prints URL/license)
+    code = os.system(f'kaggle datasets download -d "{slug}" -p "{dest}" --quiet --unzip')
+    if code != 0:
+        raise RuntimeError(f"Failed to download {slug}. Ensure Kaggle CLI is installed and credentials are set.")
 
+# ---------------------------
+# CSV/TSV reader (sniff)
+# ---------------------------
 def read_csv_any(path: Path):
     try:
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
+        with path.open('r', encoding='utf-8', errors='ignore') as f:
             sample = f.read(4096); f.seek(0)
-            try: dialect = csv.Sniffer().sniff(sample)
-            except Exception: dialect = csv.excel_tab if path.suffix.lower()==".tsv" else csv.excel
-            rdr = csv.DictReader(f, dialect=dialect)
-            return [r for r in rdr]
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+            except Exception:
+                dialect = csv.excel_tab if path.suffix.lower()=='.tsv' else csv.excel
+            return list(csv.DictReader(f, dialect=dialect))
     except Exception:
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
-            rdr = csv.DictReader(f)
-            return [r for r in rdr]
+        with path.open('r', encoding='utf-8', errors='ignore') as f:
+            return list(csv.DictReader(f))
 
-# ----------------------------
-# Cleaning: regex/NLP-ish heuristics
-# ----------------------------
-URL_RE   = re.compile(r"https?://\S+|www\.\S+", re.I)
-USER_RE  = re.compile(r"u/[A-Za-z0-9_-]+|@[A-Za-z0-9_]+")
-SUB_RE   = re.compile(r"r/[A-Za-z0-9_]+")
-CODE_RE  = re.compile(r"`{1,3}.*?`{1,3}", re.S)
-MULTI_WS = re.compile(r"\s+")
-REPEAT_PUNCT = re.compile(r"([!?.,])\1{3,}")
-REPEAT_CHAR  = re.compile(r"(.)\1{4,}")  # aaaaa -> aaa
-EMOJI_RE = re.compile(
-    "[" +
-    "\U0001F600-\U0001F64F" +  # emoticons
-    "\U0001F300-\U0001F5FF" +  # symbols & pictographs
-    "\U0001F680-\U0001F6FF" +  # transport & map
-    "\U0001F1E0-\U0001F1FF" +  # flags
-    "\U00002700-\U000027BF" +  # dingbats
-    "\U00002600-\U000026FF" +  # misc
-    "]+", flags=re.UNICODE)
+# ---------------------------
+# Cleaning / keywordization
+# ---------------------------
+_STOP = {
+    'a','an','the','and','or','but','if','while','of','to','in','on','for','from','by',
+    'with','about','as','at','into','through','during','before','after','above','below',
+    'up','down','out','off','over','under','again','further','then','once','here','there',
+    'when','where','why','how','all','any','both','each','few','more','most','other','some',
+    'such','no','nor','not','only','own','same','so','than','too','very','can','will','just',
+    'don','should','now','i','me','my','we','our','you','your','he','she','it','they','them',
+    'is','am','are','was','were','be','been','being','do','does','did','doing','have','has',
+    'had','having','this','that','these','those'
+}
 
-BOILERPLATE_PHRASES = [
-    "subscribe", "follow me", "buy now", "promo code", "click here",
-    "visit my profile", "like and share", "giveaway", "discount",
-    "dm me", "telegram", "whatsapp", "bit.ly", "tinyurl", " t.me/",
-]
-TRASH_TOKENS = {"[deleted]", "[removed]"}
+_URL_RE      = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
+_EMAIL_RE    = re.compile(r'\b[\w\.-]+@[\w\.-]+\.\w+\b')
+_MENTION_RE  = re.compile(r'@\w+')
+_HASHTAG_RE  = re.compile(r'#\w+')
+_NONWORD_RE  = re.compile(r'[^a-z0-9\s]+')
+_MULTI_WS_RE = re.compile(r'\s+')
+_REPEAT_RE   = re.compile(r'(.)\1{5,}')  # e.g., 'aaaaaa'
+_EMOJI_RE    = re.compile(
+    "["                      # common emoji/ pictographs
+    "\U0001F600-\U0001F64F"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F1E0-\U0001F1FF"
+    "\U00002700-\U000027BF"
+    "\U000024C2-\U0001F251"
+    "]+", flags=re.UNICODE
+)
 
-def load_profanity_list(path: str):
-    built_in = {
-        # small placeholder list; you can expand via --profanity-file
-        "fuck","shit","bitch","asshole","bastard","dumbass","douche","slut","whore"
-    }
-    if not path: return built_in
-    p = Path(path)
-    if not p.exists(): return built_in
-    words = set(built_in)
-    with p.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            w = line.strip().lower()
-            if w: words.add(w)
-    return words
+_CUSTOM_PROFANITY = set()
 
-PROFANITY = load_profanity_list(args.profanity_file)
+def _init_filters():
+    # custom profanity list
+    if args.profanity_file:
+        p = Path(args.profanity_file)
+        if p.is_file():
+            with p.open('r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    w = line.strip().lower()
+                    if w:
+                        _CUSTOM_PROFANITY.add(w)
+            print(f"[info] loaded {len(_CUSTOM_PROFANITY)} custom profanity tokens")
 
-def _strip_noise(s: str) -> str:
-    s = s.replace("\u200b","")              # zero-width
-    s = CODE_RE.sub(" ", s)
-    s = URL_RE.sub(" ", s)
-    s = USER_RE.sub(" ", s)
-    s = SUB_RE.sub(" ", s)
-    s = EMOJI_RE.sub(" ", s)
-    s = REPEAT_PUNCT.sub(r"\1\1", s)
-    s = REPEAT_CHAR.sub(r"\1\1\1", s)
-    s = MULTI_WS.sub(" ", s).strip()
-    return s
+    # better_profanity
+    if args.strip_profanity == 'on' and _bp is not None:
+        try:
+            _bp.load_censor_words()
+        except Exception:
+            pass
 
-def _word_count(s: str) -> int:
-    return len([w for w in s.split() if w])
+    # spaCy
+    global _spacy_nlp
+    if args.keywordize == 'spacy':
+        if _spacy_nlp is None:
+            try:
+                _spacy_nlp = spacy.load('en_core_web_sm', disable=['ner','textcat'])
+            except Exception:
+                print("[warn] spaCy model not available; falling back to simple keywordization.")
+                args.keywordize = 'simple'
 
-def _is_offtopic(s: str) -> bool:
-    low = s.lower()
-    if any(t in low for t in TRASH_TOKENS): return True
-    if sum(1 for c in s if c.isalpha()) < 0.4 * max(1,len(s)): return True
-    if any(ph in low for ph in BOILERPLATE_PHRASES): return True
+_init_filters()
+
+def _is_spammy_raw(x: str) -> bool:
+    if not x:
+        return True
+    if len(x) < args.min_chars:
+        return True
+    if _REPEAT_RE.search(x):
+        return True
+    # lightweight promo spam cues
+    low = x.lower()
+    for kw in ("buy now", "promo code", "discount", "follow me", "subscribe", "click link", "http://bit.ly", "free followers"):
+        if kw in low:
+            return True
     return False
 
-def _has_profanity(s: str) -> bool:
-    tokens = re.findall(r"[a-zA-Z']{2,}", s.lower())
-    return any(t in PROFANITY for t in tokens)
-
-def clean_and_filter(text: str, min_words: int, max_words: int):
-    """Returns (ok, cleaned_text, reason_if_rejected)"""
-    if not text: return (False, "", "empty")
-    s = _strip_noise(str(text))
-    if _is_offtopic(s): return (False, "", "offtopic_or_trash")
-    wc = _word_count(s)
-    if wc < min_words: return (False, "", f"too_short({wc})")
-    if wc > max_words: return (False, "", f"too_long({wc})")
-    if _has_profanity(s): return (False, "", "profanity")
-    return (True, s, "")
-
-# ----------------------------
-# DSM-5 keyword map & validation
-# ----------------------------
-def build_dsm_keyword_map(dsm_path: Path):
-    """
-    Parse DSM-5 text to a simple keyword map per disorder.
-    Assumes sections headed by ALL-CAPS disorder lines. Produces a set of
-    de-duplicated, lowercased keywords (minus stopwords & tiny tokens).
-    """
-    if not dsm_path.exists():
-        return {}
-
-    with dsm_path.open("r", encoding="utf-8", errors="ignore") as f:
-        lines = f.read().splitlines()
-
-    disorder = None
-    bag = {}
-    STOP = set("""
-        the a an of and or to for with without in on at by from into out over under above below
-        as is are was were be been being this that those these it its their them they he she his her
-        have has had do does did not no nor but if then while when where who whom whose which what
-        i you we us our your my mine yours theirs herself himself itself ourselves themselves
-    """.split())
-
-    def feed(d, line):
-        tokens = re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", line.lower())
-        toks = [t.strip("-") for t in tokens if len(t.strip("-"))>=3 and t not in STOP]
-        if toks:
-            bag.setdefault(d, set()).update(toks)
-
-    for line in lines:
-        if line.strip() and line.isupper() and len(line.split()) < 10:
-            disorder = line.title().strip()
-            bag.setdefault(disorder, set())
-        else:
-            if disorder:
-                feed(disorder, line)
-
-    # Canonical keys to map dataset labels onto
-    canonical = {
-        "Anxiety":"Anxiety",
-        "Major Depressive Disorder":"Depression",
-        "Depression":"Depression",
-        "Bipolar I Disorder":"Bipolar",
-        "Bipolar Ii Disorder":"Bipolar",
-        "Bipolar":"Bipolar",
-        "Posttraumatic Stress Disorder":"PTSD",
-        "Ptsd":"PTSD",
-        "Attention-Deficit/Hyperactivity Disorder":"ADHD",
-        "Adhd":"ADHD",
-        "Obsessive-Compulsive Disorder":"OCD",
-        "Ocd":"OCD",
-    }
-    out = {"Anxiety":set(), "Depression":set(), "Bipolar":set(), "PTSD":set(), "ADHD":set(), "OCD":set()}
-    for k, v in bag.items():
-        key = canonical.get(k, None)
-        if key in out:
-            out[key].update(v)
-    # prune overly common stems
-    for k in out:
-        out[k] = {w for w in out[k] if len(w)>=4}
+def _strip_profanity_tokens(tokens):
+    if args.strip_profanity != 'on':
+        return tokens
+    out = []
+    for t in tokens:
+        tl = t.lower()
+        if tl in _CUSTOM_PROFANITY:
+            continue
+        if _bp is not None and _bp.contains_profanity(t):
+            continue
+        out.append(t)
     return out
 
-DSM_KW = build_dsm_keyword_map(Path(args.dsm_file))
-print(f"[info] DSM map built for: {', '.join([k for k,v in DSM_KW.items() if v]) or 'none'}")
+def _dedupe_tokens(tokens):
+    if args.unique_keywords == 'off':
+        return tokens
+    seen = set(); out = []
+    for t in tokens:
+        if t in seen: continue
+        seen.add(t); out.append(t)
+    return out
 
-def normalize_label(label: str):
-    if not label: return None
-    s = label.lower().strip()
-    s = s.replace("_"," ").replace("-"," ")
-    if "ptsd" in s: return "PTSD"
-    if "adhd" in s: return "ADHD"
-    if "bipolar" in s: return "Bipolar"
-    if "depress" in s: return "Depression"
-    if "anx" in s: return "Anxiety"
-    if "ocd" in s: return "OCD"
-    return None  # only validate known DSM target classes
+def keywordize_text(text: str) -> str:
+    if not text:
+        return ""
+    x = str(text)
 
-def dsm_validate(label: str, text: str, mode: str):
-    """Return (ok, matched_keywords_set_or_empty)."""
-    if mode == "off": return (True, set())
-    cls = normalize_label(label)
-    if not cls or cls not in DSM_KW or not DSM_KW[cls]:
-        return (True, set())  # nothing to validate against
+    # remove URLs/emails/mentions/hashtags
+    x = _URL_RE.sub(' ', x)
+    x = _EMAIL_RE.sub(' ', x)
+    x = _MENTION_RE.sub(' ', x)
+    x = _HASHTAG_RE.sub(' ', x)
 
-    words = set(re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", text.lower()))
-    hits = {w for w in words if w in DSM_KW[cls]}
-    if mode == "soft":
-        return (len(hits) >= 1, hits)
-    else:  # strict
-        return (len(hits) >= 2, hits)
+    if args.strip_emojis == 'on':
+        x = _EMOJI_RE.sub(' ', x)
 
-# ----------------------------
-# Rejection logging & dedupe
-# ----------------------------
-REJECT_FIELDS = ["source","reason","label","raw_excerpt"]
-rej_fp = rejects_out.open("w", newline="", encoding="utf-8")
-rej_csv = csv.DictWriter(rej_fp, fieldnames=REJECT_FIELDS); rej_csv.writeheader()
+    x = x.lower()
+    x = _NONWORD_RE.sub(' ', x)
+    x = _MULTI_WS_RE.sub(' ', x).strip()
+    if not x:
+        return ""
 
-SEEN = set()  # dedupe on cleaned text (exact match)
-def maybe_emit(post_text: str, task: str, answer: str, source: str, label_for_dsm: str|None=None, min_words=None, max_words=None):
-    ok, cleaned, reason = clean_and_filter(post_text, min_words or args.min_words, max_words or args.max_words)
-    if not ok:
-        rej_csv.writerow({"source":source,"reason":reason,"label":label_for_dsm or "", "raw_excerpt":(post_text or "")[:280]})
+    if args.keywordize == 'spacy' and _spacy_nlp is not None:
+        doc = _spacy_nlp(x)
+        toks = []
+        for tok in doc:
+            if tok.is_space or tok.is_punct or tok.is_stop: continue
+            if tok.pos_ not in ('NOUN','PROPN','ADJ','VERB'): continue
+            lemma = (tok.lemma_ or tok.text).lower()
+            if lemma in _STOP or len(lemma) <= 1: continue
+            toks.append(lemma)
+    else:
+        toks = [t for t in x.split() if t not in _STOP and len(t) > 1]
+
+    toks = _strip_profanity_tokens(toks)
+    toks = _dedupe_tokens(toks)
+    if len(toks) < args.min_kw:
+        return ""
+    return " ".join(toks)
+
+def prepare_post(raw_text: str, title: str = "") -> str | None:
+    if not raw_text:
         return None
-    # DSM validation (only disorder tasks)
-    v_ok, hits = dsm_validate(label_for_dsm or "", cleaned, args.dsm_validate)
-    if not v_ok:
-        rej_csv.writerow({"source":source,"reason":f"dsm_validate_fail({args.dsm_validate})", "label":label_for_dsm or "", "raw_excerpt":cleaned[:280]})
+    full = raw_text
+    if title and title.strip() and title not in raw_text:
+        full = f"{title.strip()}\n{raw_text}"
+    if _is_spammy_raw(full):
         return None
-    # dedupe
-    key = cleaned.lower()
-    if key in SEEN:
-        rej_csv.writerow({"source":source,"reason":"duplicate", "label":label_for_dsm or "", "raw_excerpt":cleaned[:280]})
+    full = " ".join(full.split())
+    kw = keywordize_text(full)
+    if not kw:
         return None
-    SEEN.add(key)
-    return f"Post: {cleaned}\nTask: {task}\nAnswer: {answer}<|endoftext|>"
+    return kw
 
-# ----------------------------
-# DATASETS
-# ----------------------------
+# ---------------------------
+# Streaming writers (train/val)
+# ---------------------------
+dedupe_hashes = set()
 
-all_lines = []
+train_f = train_path.open('w', encoding='utf-8')
+val_f   = val_path.open('w',   encoding='utf-8')
 
-# 1) KamarulAdha: mental-disorders-identification-reddit-nlp
-slug = "kamaruladha/mental-disorders-identification-reddit-nlp"
-d = cache_dir/"mental_disorders_identification"; download_kaggle_dataset(slug, d)
-csvs = sorted(d.glob("*.csv"))
-if not csvs: raise FileNotFoundError(f"No CSV for {slug}")
-print(f"[+] Processing {csvs[0].name}")
-for row in read_csv_any(csvs[0]):
-    text = (row.get("text") or row.get("body") or row.get("post") or "").strip()
-    title = (row.get("title") or "").strip()
-    if title and title not in text: text = f"{title}\n{text}".strip()
-    if not text: continue
-    label = (row.get("subreddit") or row.get("label") or "").strip()
-    low = label.lower()
-    if low == "adhd": label = "ADHD"
-    elif low == "ptsd": label = "PTSD"
-    elif low == "ocd": label = "OCD"
-    elif label.islower(): label = label.capitalize()
-    sample = maybe_emit(text, "Identify which mental health condition this post is about.", label, "kamaruladha", label_for_dsm=label)
-    if sample: all_lines.append(sample)
+def emit_example(sample: str):
+    """Route a sample to train/val (approx ratio), with dedupe by sha1 of text."""
+    sha = hashlib.sha1(sample.encode('utf-8')).hexdigest()
+    if len(dedupe_hashes) < args.dedupe_cap:
+        if sha in dedupe_hashes:
+            return
+        dedupe_hashes.add(sha)
+    # add EOT separator
+    line = sample + "\n"
+    if random.random() < args.val_ratio:
+        val_f.write(line)
+    else:
+        train_f.write(line)
 
-# 2) MichelleVP Bipolar (sentiment)
-slug = "michellevp/mental-health-dataset-bipolar"
-d = cache_dir/"mental_health_bipolar"; download_kaggle_dataset(slug, d)
-files = list(d.glob("*"))
-f = next((x for x in files if x.suffix.lower() in (".csv",".xlsx")), None)
-if not f: raise FileNotFoundError(f"No CSV/XLSX for {slug}")
-print(f"[+] Processing {f.name}")
-rows = read_csv_any(f) if f.suffix.lower()==".csv" else (pd.read_excel(f).to_dict(orient="records") if pd else [])
-for row in rows:
-    text = (row.get("text") or row.get("post") or row.get("content") or "").strip()
-    if not text: continue
-    sent = (row.get("sentiment") or row.get("sentiment_label") or "").strip().lower()
-    if   sent=="1" or "pos" in sent: sent = "Positive"
-    elif sent=="-1" or "neg" in sent: sent = "Negative"
-    elif sent=="0" or "neu" in sent: sent = "Neutral"
-    else: sent = sent.capitalize() if sent else None
-    if not sent: continue
-    sample = maybe_emit(text, "Determine the sentiment expressed in the following bipolar discussion post.", sent, "michellevp_bipolar")
-    if sample: all_lines.append(sample)
-    risk = (row.get("risk_factor") or "").strip()
-    if risk:
-        sample = maybe_emit(text, "Identify any risk factor mentioned in the post.", risk, "michellevp_bipolar")
-        if sample: all_lines.append(sample)
+# ---------------------------
+# Tokenize to .bin (stream, no token cap)
+# ---------------------------
+def tokenize_text_file_to_bin(txt_path: Path):
+    if GPT2TokenizerFast is None:
+        raise RuntimeError("transformers not installed (pip install transformers). Needed for .bin tokenization.")
+    tok = GPT2TokenizerFast.from_pretrained("gpt2")
+    if tok.vocab_size > 65535:
+        raise ValueError(f"Vocab {tok.vocab_size} exceeds uint16 range (change dtype to uint32 if needed).")
+    bin_path = txt_path.with_suffix('.bin')
+    print(f"[tokenize] {txt_path} -> {bin_path} (streaming, no token cap)")
+    with txt_path.open('r', encoding='utf-8') as fin, open(bin_path, 'wb') as fout:
+        for line in fin:
+            ids = tok.encode(line)
+            np.asarray(ids, dtype=np.uint16).tofile(fout)
 
-# 3) MichelleVP Anxiety (binary)
-slug = "michellevp/predicting-anxiety-in-mental-health-data"
-d = cache_dir/"mental_health_anxiety"; download_kaggle_dataset(slug, d)
-f = next((x for x in d.glob("*") if x.suffix.lower() in (".csv",".xlsx")), None)
-if not f: raise FileNotFoundError(f"No CSV/XLSX for {slug}")
-print(f"[+] Processing {f.name}")
-rows = read_csv_any(f) if f.suffix.lower()==".csv" else (pd.read_excel(f).to_dict(orient="records") if pd else [])
-for row in rows:
-    text = (row.get("text") or row.get("post") or row.get("content") or "").strip()
-    if not text: continue
-    val = (row.get("anxiety") or row.get("label") or row.get("class") or "").strip().lower()
-    if not val: continue
-    ans = "Yes" if val in ("1","true","yes","anxiety") else "No"
-    sample = maybe_emit(text, "Does the following post indicate an anxiety disorder? Answer Yes or No.", ans, "michellevp_anxiety",
-                        label_for_dsm="Anxiety" if ans=="Yes" else None)
-    if sample: all_lines.append(sample)
+# ---------------------------
+# Datasets
+# ---------------------------
+def run_kamaruladha():
+    slug = "kamaruladha/mental-disorders-identification-reddit-nlp"
+    d = cache_dir / "mental_disorders_identification"
+    kaggle_download(slug, d)
+    csvs = sorted(d.glob("*.csv"))
+    if not csvs:
+        return
+    print(f"[+] Processing {csvs[0].name}")
+    for row in read_csv_any(csvs[0]):
+        text = (row.get('text') or row.get('body') or row.get('post') or "")
+        title = (row.get('title') or "")
+        post = prepare_post(text, title)
+        if not post: continue
+        label = (row.get('subreddit') or row.get('label') or "").strip()
+        if not label: continue
+        low = label.lower()
+        mapping = {"adhd":"ADHD","ptsd":"PTSD","ocd":"OCD"}
+        label = mapping.get(low, label.capitalize() if low==label else label)
+        emit_example(f"Post: {post}\nTask: Identify which mental health condition this post is about.\nAnswer: {label}<|endoftext|>")
 
-# 4) Dreaddit Stress (Yes/No) – skip DSM validation (stress != DSM diagnosis per se)
-slug = "shuvojitdas/stress-analysis"
-d = cache_dir/"stress_analysis"; download_kaggle_dataset(slug, d)
-files = list(d.glob("*.csv")) or list(d.glob("*.tsv"))
-if not files: raise FileNotFoundError(f"No CSV/TSV for {slug}")
-print("[+] Processing Dreaddit files...")
-for f in files:
-    for row in read_csv_any(f):
-        text = (row.get("text") or row.get("post") or row.get("body") or "").strip()
-        if not text: continue
-        lab = (row.get("label") or row.get("stress") or row.get("y") or "").strip().lower()
-        ans = "Yes" if lab in ("1","yes","true","stressed") else "No"
-        sample = maybe_emit(text, "Determine if the user is stressed in the following post. Answer Yes or No.", ans, "dreaddit")
-        if sample: all_lines.append(sample)
-
-# 5) NeelGhoshal Reddit mental health (multi-class)
-slug = "neelghoshal/reddit-mental-health-data"
-d = cache_dir/"reddit_mental_health_data"; download_kaggle_dataset(slug, d)
-f = next((x for x in d.glob("*") if x.suffix.lower() in (".csv",".tsv")), None)
-if not f: raise FileNotFoundError(f"No CSV/TSV for {slug}")
-print(f"[+] Processing {f.name}")
-mapping = {'0':"Stress",'1':"Depression",'2':"Bipolar",'3':"Anxiety",'4':"PTSD"}
-for row in read_csv_any(f):
-    text = (row.get("text") or row.get("post") or row.get("body") or "").strip()
-    if not text: continue
-    lab = (row.get("target") or row.get("label") or row.get("class") or "").strip()
-    if not lab: continue
-    name = mapping.get(lab, lab.capitalize())
-    sample = maybe_emit(text, "Identify the mental health issue discussed in this post (Stress, Depression, Bipolar, Anxiety, or PTSD).", name,
-                        "neelghoshal", label_for_dsm=name if name in {"Depression","Bipolar","Anxiety","PTSD","ADHD","OCD"} else None)
-    if sample: all_lines.append(sample)
-
-# 6) Social Anxiety severity (bin numeric/categorical)
-slug = "natezhang123/social-anxiety-dataset"
-d = cache_dir/"social_anxiety_dataset"; download_kaggle_dataset(slug, d)
-preferred = d/"enhanced_anxiety_dataset.csv"
-f = preferred if preferred.exists() else next((x for x in d.glob("*") if x.suffix.lower() in (".csv",".xlsx")), None)
-if f:
+def run_bipolar():
+    slug = "michellevp/mental-health-dataset-bipolar"
+    d = cache_dir / "mental_health_bipolar"
+    kaggle_download(slug, d)
+    f = next((p for p in d.glob("*") if p.suffix.lower() in (".csv",".xlsx")), None)
+    if not f: return
     print(f"[+] Processing {f.name}")
     rows = read_csv_any(f) if f.suffix.lower()==".csv" else (pd.read_excel(f).to_dict(orient="records") if pd else [])
-    if rows:
-        keys0 = list(rows[0].keys())
-        nk = {k: k.lower().strip().replace(" ","_") for k in keys0}
-        pri = ("level","severity","score","class","label","category","status")
-        cand = [k for k, n in nk.items() if "anxiety" in n and any(t in n for t in pri)] or \
-               [k for k, n in nk.items() if any(t in n for t in pri)]
-        label_col = cand[0] if cand else None
-        if label_col:
-            # choose a few features to surface
-            feat_pool = [k for k in keys0 if k != label_col]
-            def feat_score(name: str):
-                n = nk[name]
-                return sum(t in n for t in ("anxiety","social","avoid","fear","score","scale","sleep","caffeine","exercise","alcohol"))
-            feat_pool.sort(key=feat_score, reverse=True)
-            feats = feat_pool[:3]
+    for row in rows:
+        text = (row.get('text') or row.get('post') or row.get('content') or "")
+        post = prepare_post(text)
+        if not post: continue
+        sent = (row.get('sentiment') or row.get('sentiment_label') or "")
+        if not str(sent).strip(): continue
+        s = str(sent).lower()
+        if s == '1' or 'pos' in s: sent = "Positive"
+        elif s == '-1' or 'neg' in s: sent = "Negative"
+        elif s == '0' or 'neu' in s: sent = "Neutral"
+        else: sent = str(sent).capitalize()
+        emit_example(f"Post: {post}\nTask: Determine the sentiment expressed in the following bipolar discussion post.\nAnswer: {sent}<|endoftext|>")
+        risk = (row.get('risk_factor') or "").strip()
+        if risk:
+            emit_example(f"Post: {post}\nTask: Identify any risk factor mentioned in the post.\nAnswer: {risk}<|endoftext|>")
 
-            # detect numeric distribution
-            def f2(s):
-                try: return float(str(s).strip())
-                except: return None
-            raw = [str(r.get(label_col,"")).strip() for r in rows if str(r.get(label_col,"")).strip()!=""]
-            nums = [x for x in (f2(v) for v in raw) if x is not None]
-            if len(nums) >= max(50, int(0.2*len(raw))):
-                arr = np.array(nums, dtype=float)
-                if np.allclose(arr.min(), arr.max()):
-                    def sev(x): return "Moderate"
-                else:
-                    q1,q2,q3 = np.quantile(arr, [0.25,0.5,0.75])
-                    def sev(x):
-                        x=float(x)
-                        if x<=q1: return "None"
-                        elif x<=q2: return "Mild"
-                        elif x<=q3: return "Moderate"
-                        else: return "Severe"
-            else:
-                def sev(s):
-                    sl=str(s).lower()
-                    if sl in ("0","none","no","low","lowest","minimal"): return "None"
-                    if sl in ("1","mild","slight","light"): return "Mild"
-                    if sl in ("2","moderate","med","medium"): return "Moderate"
-                    if sl in ("3","severe","high","very high"): return "Severe"
-                    if "none" in sl: return "None"
-                    if "mild" in sl or "low" in sl: return "Mild"
-                    if "moderate" in sl or "mid" in sl: return "Moderate"
-                    if "severe" in sl or "high" in sl: return "Severe"
-                    return "Moderate"
+def run_anxiety_binary():
+    slug = "michellevp/predicting-anxiety-in-mental-health-data"
+    d = cache_dir / "mental_health_anxiety"
+    kaggle_download(slug, d)
+    f = next((p for p in d.glob("*") if p.suffix.lower() in (".csv",".xlsx")), None)
+    if not f: return
+    print(f"[+] Processing {f.name}")
+    rows = read_csv_any(f) if f.suffix.lower()==".csv" else (pd.read_excel(f).to_dict(orient="records") if pd else [])
+    for r in rows:
+        text = (r.get('text') or r.get('post') or r.get('content') or "")
+        post = prepare_post(text)
+        if not post: continue
+        val = (r.get('anxiety') or r.get('label') or r.get('class') or "")
+        val = str(val).strip().lower()
+        if not val: continue
+        ans = "Yes" if val in ("1","true","yes","anxiety") else "No"
+        emit_example(f"Post: {post}\nTask: Does the following post indicate an anxiety disorder? Answer Yes or No.\nAnswer: {ans}<|endoftext|>")
 
-            for r in rows:
-                lbl = r.get(label_col, None)
-                if lbl is None or str(lbl).strip()=="": continue
-                level = sev(lbl)
-                desc = []
-                for fk in feats:
-                    v = str(r.get(fk,"")).strip()
-                    if v and v.lower()!="nan":
-                        desc.append(f"{fk}: {v}")
-                text = f"The individual reports: {'; '.join(desc) if desc else 'various lifestyle and screening features available'}."
-                sample = maybe_emit(text, "Classify the person's social anxiety level (None, Mild, Moderate, or Severe).", level, "social_anxiety")
-                if sample: all_lines.append(sample)
+def run_dreaddit():
+    slug = "shuvojitdas/stress-analysis"
+    d = cache_dir / "stress_analysis"
+    kaggle_download(slug, d)
+    files = list(d.glob("*.csv")) or list(d.glob("*.tsv"))
+    if not files: return
+    print("[+] Processing Dreaddit files...")
+    for f in files:
+        for row in read_csv_any(f):
+            text = (row.get('text') or row.get('post') or row.get('body') or "")
+            post = prepare_post(text)
+            if not post: continue
+            lab = (row.get('label') or row.get('stress') or row.get('y') or "")
+            ans = "Yes" if str(lab).strip().lower() in ("1","yes","true","stressed") else "No"
+            emit_example(f"Post: {post}\nTask: Determine if the user is stressed in the following post. Answer Yes or No.\nAnswer: {ans}<|endoftext|>")
 
-# 7) Entenam RMHD (recursive + canonical labels)
-slug = "entenam/reddit-mental-health-dataset"
-d = cache_dir/"reddit_mental_health_dataset"; download_kaggle_dataset(slug, d)
-cands = [p for p in d.rglob("*") if p.is_file() and p.suffix.lower() in (".csv",".tsv",".xlsx",".json",".jsonl")]
-if cands:
+def run_neel():
+    slug = "neelghoshal/reddit-mental-health-data"
+    d = cache_dir / "reddit_mental_health_data"
+    kaggle_download(slug, d)
+    f = next((p for p in d.glob("*") if p.suffix.lower() in (".csv",".tsv")), None)
+    if not f: return
+    print(f"[+] Processing {f.name}")
+    mapping = {'0':"Stress",'1':"Depression",'2':"Bipolar",'3':"Anxiety",'4':"PTSD"}
+    for row in read_csv_any(f):
+        text = (row.get('text') or row.get('post') or row.get('body') or "")
+        post = prepare_post(text)
+        if not post: continue
+        lab = (row.get('target') or row.get('label') or row.get('class') or "")
+        lab = str(lab).strip()
+        if not lab: continue
+        name = mapping.get(lab, lab.capitalize())
+        emit_example(f"Post: {post}\nTask: Identify the mental health issue discussed in this post (Stress, Depression, Bipolar, Anxiety, or PTSD).\nAnswer: {name}<|endoftext|>")
+
+def run_social_anxiety():
+    slug = "natezhang123/social-anxiety-dataset"
+    d = cache_dir / "social_anxiety_dataset"
+    kaggle_download(slug, d)
+    preferred = d / "enhanced_anxiety_dataset.csv"
+    f = preferred if preferred.exists() else next((p for p in d.glob("*") if p.suffix.lower() in (".csv",".xlsx")), None)
+    if not f:
+        print("[!] Social Anxiety dataset missing; skipping.")
+        return
+    print(f"[+] Processing {f.name}")
+    rows = read_csv_any(f) if f.suffix.lower()==".csv" else (pd.read_excel(f).to_dict(orient="records") if pd else [])
+    if not rows:
+        print("[!] Social Anxiety parsed empty; skipping.")
+        return
+    keys0 = list(rows[0].keys())
+    def _norm(s): return s.lower().strip().replace(" ", "_")
+    pri = ("level","severity","score","class","label","category","status")
+    label_col = None
+    for k in keys0:
+        nk = _norm(k)
+        if "anxiety" in nk and any(t in nk for t in pri):
+            label_col = k; break
+    if not label_col:
+        for k in keys0:
+            if any(t in _norm(k) for t in pri):
+                label_col = k; break
+    if not label_col:
+        print("[!] Could not infer Social Anxiety label; skipping.")
+        return
+    # numeric?
+    raw_vals = [str(r.get(label_col,"")).strip() for r in rows if str(r.get(label_col,"")).strip()!=""]
+    def _to_float(x):
+        try: return float(x)
+        except: return None
+    numeric_vals = [v for v in (_to_float(x) for x in raw_vals) if v is not None]
+    if numeric_vals:
+        arr = np.array(numeric_vals, dtype=float)
+        if np.allclose(arr.min(), arr.max()):
+            q1=q2=q3=arr.min(); mode = "degenerate"
+        else:
+            q1,q2,q3 = np.quantile(arr, [0.25,0.5,0.75]); mode = "quartiles"
+        def num2sev(x):
+            if mode=="degenerate": return "Moderate"
+            if x<=q1: return "None"
+            elif x<=q2: return "Mild"
+            elif x<=q3: return "Moderate"
+            else: return "Severe"
+    else:
+        def cat2sev(s):
+            sl = s.lower()
+            if sl in ("0","none","no","low","lowest","minimal"): return "None"
+            if sl in ("1","mild","slight","light"): return "Mild"
+            if sl in ("2","moderate","med","medium"): return "Moderate"
+            if sl in ("3","severe","high","very high"): return "Severe"
+            if "none" in sl: return "None"
+            if "mild" in sl or "low" in sl: return "Mild"
+            if "moderate" in sl or "mid" in sl: return "Moderate"
+            if "severe" in sl or "high" in sl: return "Severe"
+            return "Moderate"
+    # pick up to 3 informative features (not the label)
+    feat_pool = [k for k in keys0 if k != label_col]
+    def score_feat(name):
+        n=_norm(name); score=0
+        for t in ("anxiety","social","avoid","fear","score","scale","sleep","caffeine","alcohol","exercise"): 
+            if t in n: score+=1
+        return score
+    feat_pool.sort(key=score_feat, reverse=True)
+    chosen = feat_pool[:3]
+    for r in rows:
+        raw = r.get(label_col,"")
+        if raw is None or str(raw).strip()=="":
+            continue
+        sev = num2sev(_to_float(raw)) if numeric_vals and _to_float(raw) is not None else (cat2sev(str(raw)) if not numeric_vals else None)
+        if sev is None: 
+            continue
+        pieces=[]
+        for fk in chosen:
+            v = str(r.get(fk,"")).strip()
+            if v and v.lower()!="nan":
+                pieces.append(f"{fk}: {v}")
+        desc = "; ".join(pieces) if pieces else "various lifestyle and screening features available"
+        # keywordize the constructed sentence too
+        post = prepare_post(f"The individual reports: {desc}.")
+        if not post: continue
+        emit_example(f"Post: {post}\nTask: Classify the person's social anxiety level (None, Mild, Moderate, or Severe).\nAnswer: {sev}<|endoftext|>")
+
+def run_rmhd():
+    if args.skip_rmhd:
+        print("[*] Skipping RMHD as requested.")
+        return
+    slug = "entenam/reddit-mental-health-dataset"
+    d = cache_dir / "reddit_mental_health_dataset"
+    kaggle_download(slug, d)
+    cands = [p for p in d.rglob("*") if p.is_file() and p.suffix.lower() in (".csv",".tsv",".xlsx",".json",".jsonl")]
+    if not cands:
+        print("[!] No RMHD files found; skipping.")
+        return
     print(f"[+] Processing Entenam RMHD ({len(cands)} file(s) found; recursive).")
-
-    def canon_disorder(name: str):
-        if not name: return None
-        s = name.lower().strip().replace("_"," ")
-        if s.startswith("r/"): s = s[2:]
-        for k,v in {
-            "anxiety":"Anxiety","depression":"Depression","bipolar":"Bipolar",
-            "ptsd":"PTSD","adhd":"ADHD","ocd":"OCD","stress":"Stress",
-        }.items():
-            if k in s: return v
-        return None
-
-    def handle_row(row: dict):
+    rmhd_seen_texts = set()
+    def canon_disorder(name: str) -> str:
+        if not name: return ""
+        low = name.strip().lower()
+        if low.startswith("r/"): low = low[2:]
+        low = low.replace("_"," ")
+        for k,v in {"anxiety":"Anxiety","depression":"Depression","bipolar":"Bipolar","ptsd":"PTSD","adhd":"ADHD","stress":"Stress","ocd":"OCD"}.items():
+            if k in low: return v
+        return " ".join(w.capitalize() for w in low.split())
+    def handle(row: dict):
         title = (row.get("title") or "").strip()
-        text = ""
-        for k in ("text","post","content","body","selftext","comment","message","description"):
+        tfields = ("text","post","content","body","selftext","comment","message","description")
+        raw = ""
+        for k in tfields:
             v = row.get(k)
             if v and str(v).strip():
-                text = str(v).strip(); break
-        if not text and title: text = title
-        if not text or len(text) < 20: return
-        if title and title not in text: text = f"{title}\n{text}"
-        dis = None
+                raw = str(v); break
+        if not raw and title:
+            raw = title
+        if not raw: return
+        post = prepare_post(raw, title)
+        if not post: return
+        if post in rmhd_seen_texts:
+            pass
+        elif len(rmhd_seen_texts) < args.rmhd_seen_cap:
+            rmhd_seen_texts.add(post)
+        disorder = None
         for k in ("subreddit","condition","category","label","mental_illness","diagnosis","target","class"):
             v = row.get(k)
             if v and str(v).strip():
-                dis = canon_disorder(str(v)); break
-        if not dis: dis = None
-        sample = maybe_emit(text, "Identify which mental health condition this post is about.", dis or "Unknown", "entenam",
-                            label_for_dsm=dis if dis in {"Anxiety","Depression","Bipolar","PTSD","ADHD","OCD"} else None)
-        if sample and dis: all_lines.append(sample)
-
-    for pth in sorted(cands):
-        print(f"    -> {pth.relative_to(d)}")
-        ext = pth.suffix.lower()
+                disorder = canon_disorder(str(v)); break
+        if disorder:
+            emit_example(f"Post: {post}\nTask: Identify which mental health condition this post is about.\nAnswer: {disorder}<|endoftext|>")
+    for p in sorted(cands):
+        print(f"    -> {p.relative_to(d)}")
+        ext = p.suffix.lower()
         try:
             if ext in (".csv",".tsv"):
-                for r in read_csv_any(pth): handle_row(r)
-            elif ext==".xlsx" and pd:
-                df = pd.read_excel(pth); 
-                for r in df.to_dict(orient="records"): handle_row(r)
-            elif ext==".json":
-                import json
-                with pth.open("r", encoding="utf-8") as f:
+                with p.open('r', encoding='utf-8', errors='ignore') as f:
+                    sample = f.read(8192); f.seek(0)
                     try:
-                        obj = json.load(f)
-                        rows = obj["data"] if isinstance(obj,dict) and isinstance(obj.get("data"),list) else obj if isinstance(obj,list) else []
+                        dialect = csv.Sniffer().sniff(sample)
                     except Exception:
-                        rows = []
-                for r in rows:
-                    if isinstance(r,dict): handle_row(r)
-            elif ext==".jsonl":
-                import json
-                with pth.open("r", encoding="utf-8", errors="ignore") as f:
+                        dialect = csv.excel_tab if ext==".tsv" else csv.excel
+                    for row in csv.DictReader(f, dialect=dialect):
+                        handle(row)
+            elif ext == ".xlsx":
+                if pd is None:
+                    print("[!] pandas not installed; skipping XLSX:", p.name); continue
+                for row in pd.read_excel(p).to_dict(orient="records"):
+                    handle(row)
+            elif ext == ".json":
+                with p.open('r', encoding='utf-8', errors='ignore') as f:
+                    obj = json.load(f)
+                rows = obj.get("data", []) if isinstance(obj, dict) else (obj if isinstance(obj, list) else [])
+                for row in rows:
+                    if isinstance(row, dict): handle(row)
+            elif ext == ".jsonl":
+                with p.open('r', encoding='utf-8', errors='ignore') as f:
                     for line in f:
                         line=line.strip()
                         if not line: continue
                         try:
-                            r=json.loads(line)
-                            if isinstance(r,dict): handle_row(r)
+                            row = json.loads(line)
+                            if isinstance(row, dict): handle(row)
                         except Exception:
-                            pass
+                            continue
         except Exception as e:
-            print(f"[!] Failed parsing {pth.name}: {e}")
+            print(f"[!] Failed parsing {p.name}: {e}")
 
-# 8) CID007 symptom table → diagnosis
-slug = "cid007/mental-disorder-classification"
-d = cache_dir/"mental_disorder_classification"; download_kaggle_dataset(slug, d)
-sym_path = None
-for pat in ("*.csv","*.tsv","*.xlsx"):
-    found = list(d.rglob(pat))
-    if found: sym_path = found[0]; break
-if sym_path:
-    print(f"[+] Processing {sym_path.relative_to(d)}")
-    rows = read_csv_any(sym_path) if sym_path.suffix.lower() in (".csv",".tsv") else (pd.read_excel(sym_path).to_dict(orient="records") if pd else [])
-    if rows:
-        keys0 = list(rows[0].keys())
-        def norm(s): return s.lower().strip().replace(" ","_")
-        label_col = None
-        for k in keys0:
-            n = norm(k)
-            if any(t in n for t in ("diagnos","disorder","label","class","target","illness","condition","result","category")):
-                label_col = k; break
-        if not label_col and pd:
-            df = pd.DataFrame(rows)
+def run_cid007():
+    slug = "cid007/mental-disorder-classification"
+    d = cache_dir / "mental_disorder_classification"
+    kaggle_download(slug, d)
+    pth = None
+    for ext in ("*.csv","*.tsv","*.xlsx"):
+        L = list(d.rglob(ext))
+        if L: pth = L[0]; break
+    if not pth:
+        print("[!] CID007 missing; skipping."); return
+    print(f"[+] Processing {pth.relative_to(d)}")
+    rows = read_csv_any(pth) if pth.suffix.lower() in (".csv",".tsv") else (pd.read_excel(pth).to_dict(orient="records") if pd else [])
+    if not rows:
+        print("[!] CID007 empty; skipping."); return
+    keys0 = list(rows[0].keys())
+    def norm(s): return s.lower().strip().replace(" ","_")
+    label_col = None
+    pref = ("diagnos","disorder","label","class","target","illness","condition","result")
+    for k in keys0:
+        if any(w in norm(k) for w in pref):
+            label_col = k; break
+    if not label_col:
+        if pd is not None:
+            dfh = pd.DataFrame(rows)
             for k in keys0:
-                u = df[k].nunique(dropna=True)
-                if 2 <= u <= 8 and not pd.api.types.is_numeric_dtype(df[k]): label_col = k; break
-        if label_col:
-            symptom_cols = [k for k in keys0 if k != label_col]
-            def clean_diag(x):
-                s = str(x or "").strip().lower()
-                for k,v in {"normal":"Normal","anxiety":"Anxiety","depression":"Depression","bipolar":"Bipolar","ptsd":"PTSD","ocd":"OCD","adhd":"ADHD"}.items():
-                    if k==s: return v
-                return s.title() if s else ""
-            def include_sym(v):
-                s = str(v or "").strip().lower()
-                if s in ("","nan","none"): return False
                 try:
-                    f=float(s); return f>0.0
-                except: return s in ("yes","true","present","high","mild","moderate","severe","1")
-            for r in rows:
-                diag = clean_diag(r.get(label_col,""))
-                if not diag: continue
-                feats=[]
-                for c in symptom_cols:
-                    if include_sym(r.get(c,"")):
-                        feats.append(str(c).replace("_"," ").title())
-                if not feats and diag!="Normal": continue
-                if not feats and diag=="Normal": feats=["No significant psychiatric symptoms"]
-                text = f"Patient exhibits the following symptoms: {', '.join(feats[:6])}."
-                sample = maybe_emit(text, "Determine the most likely diagnosis for this patient.", diag, "cid007",
-                                    label_for_dsm=diag if diag in {"Anxiety","Depression","Bipolar","PTSD","ADHD","OCD"} else None)
-                if sample: all_lines.append(sample)
+                    u = dfh[k].nunique(dropna=True)
+                    if 2 <= u <= 8 and not pd.api.types.is_numeric_dtype(dfh[k]): label_col = k; break
+                except Exception:
+                    pass
+    if not label_col:
+        print("[!] CID007 label not found; skipping."); return
+    symptom_cols = [k for k in keys0 if k != label_col]
+    def clean_diag(x):
+        if x is None: return ""
+        low = str(x).strip().lower()
+        mp = {"normal":"Normal","anxiety":"Anxiety","depression":"Depression","bipolar":"Bipolar","ptsd":"PTSD","ocd":"OCD","adhd":"ADHD"}
+        return mp.get(low, str(x).strip().title())
+    def include_val(v):
+        if v is None: return False
+        s = str(v).strip().lower()
+        if s in ("","nan","none"): return False
+        try:
+            return float(s) > 0.0
+        except Exception:
+            return s in ("yes","true","present","high","mild","moderate","severe","1")
+    added = 0
+    for r in rows:
+        diag = clean_diag(r.get(label_col,""))
+        if not diag: continue
+        pres = []
+        for c in symptom_cols:
+            if include_val(r.get(c,"")):
+                pres.append(str(c).replace("_"," ").strip().title())
+        if not pres and diag != "Normal": 
+            continue
+        if not pres and diag == "Normal":
+            pres = ["No significant psychiatric symptoms"]
+        # keywordize synthetic sentence too
+        post = prepare_post(f"Patient exhibits the following symptoms: {', '.join(pres[:6])}.")
+        if not post: continue
+        emit_example(f"Post: {post}\nTask: Determine the most likely diagnosis for this patient.\nAnswer: {diag}<|endoftext|>")
+        added += 1
+    print(f"[info] CID007 added {added} examples.")
 
-# 9) Panic disorder detection
-slug = "muhammadshahidazeem/panic-disorder-detection-dataset"
-d = cache_dir/"panic_disorder_detection"; download_kaggle_dataset(slug, d)
-csvs = [x for x in d.glob("*") if x.suffix.lower() in (".csv",".tsv")]
-if csvs:
+def run_panic():
+    slug = "muhammadshahidazeem/panic-disorder-detection-dataset"
+    d = cache_dir / "panic_disorder_detection"
+    kaggle_download(slug, d)
+    files = [p for p in d.glob("*") if p.suffix.lower() in (".csv",".tsv")]
+    if not files: return
     print("[+] Processing Panic Disorder CSVs...")
-    for f in csvs:
+    for f in files:
         rows = read_csv_any(f)
         if not rows: continue
-        keys0 = list(rows[0].keys())
-        label_key = next((k for k in keys0 if ("panic" in k.lower()) and any(x in k.lower() for x in ("label","disorder","target"))), None) or keys0[-1]
-        feat_keys = [k for k in keys0 if k != label_key]
+        k0 = list(rows[0].keys())
+        label_key = next((k for k in k0 if ("panic" in k.lower()) and any(x in k.lower() for x in ("label","disorder","target"))), None)
+        if not label_key:
+            label_key = k0[-1]
+        feat_keys = [k for k in k0 if k != label_key]
         for r in rows:
             lv = str(r.get(label_key,"")).strip().lower()
             ans = "Yes" if lv in ("1","yes","true","panic") else "No"
+            # build compact case description
             parts=[]
             for fk in feat_keys:
                 v = str(r.get(fk,"")).strip()
@@ -580,107 +678,95 @@ if csvs:
                     if v in ("1","yes","true"): parts.append(f"{fk.replace('_',' ')}: yes")
                 if len(parts)>=5: break
             if not parts: parts.append("no notable symptoms")
-            text = f"Patient data - {'; '.join(parts)}."
-            sample = maybe_emit(text, "Is this a case of Panic Disorder? Answer Yes or No.", ans, "panic_disorder")
-            if sample: all_lines.append(sample)
+            post = prepare_post(f"Patient data - {'; '.join(parts)}.")
+            if not post: continue
+            emit_example(f"Post: {post}\nTask: Is this a case of Panic Disorder? Answer Yes or No.\nAnswer: {ans}<|endoftext|>")
 
-# 10) Reddit ADHD (jerseyneo)
-slug = "jerseyneo/reddit-adhd-dataset"
-d = cache_dir/"reddit_adhd_dataset"; download_kaggle_dataset(slug, d)
-adhd_csvs = sorted(d.glob("*.csv"))
-if not adhd_csvs: raise FileNotFoundError(f"No CSV files for {slug}")
-print("[+] Processing ADHD CSVs (streaming)...")
-for pth in adhd_csvs:
-    print(f"    -> {pth.name}")
-    with pth.open("r", encoding="utf-8", errors="ignore") as f:
-        try:
+def run_adhd():
+    slug = "jerseyneo/reddit-adhd-dataset"
+    d = cache_dir / "reddit_adhd_dataset"
+    kaggle_download(slug, d)
+    csvs = sorted(d.glob("*.csv"))
+    if not csvs:
+        print("[!] ADHD dataset CSVs not found; skipping."); return
+    print("[+] Processing ADHD CSVs (streaming)...")
+    candidate_fields = ("selftext","body","comment","text","content","message","post","description")
+    for p in csvs:
+        print(f"    -> {p.name}")
+        with p.open('r', encoding='utf-8', errors='ignore') as f:
             sample = f.read(8192); f.seek(0)
-            dialect = csv.Sniffer().sniff(sample)
-        except Exception:
-            dialect = csv.excel
-        rdr = csv.DictReader(f, dialect=dialect)
-        for row in rdr:
-            raw = None
-            for key in ("selftext","body","comment","text","content","message","post","description"):
-                val = row.get(key)
-                if val and str(val).strip():
-                    raw = str(val); break
-            if not raw:
-                joined = " ".join(str(row.get(k,"")).strip() for k in ("title","selftext","body") if str(row.get(k,"")).strip())
-                raw = joined if joined else None
-            if not raw: continue
-            sample = maybe_emit(raw, "Identify which mental health condition this post is about.", "ADHD", "adhd", label_for_dsm="ADHD")
-            if sample: all_lines.append(sample)
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+            except Exception:
+                dialect = csv.excel
+            reader = csv.DictReader(f, dialect=dialect)
+            for row in reader:
+                raw = None
+                for k in candidate_fields:
+                    v = row.get(k)
+                    if v and str(v).strip():
+                        raw = str(v); break
+                if not raw:
+                    joined = " ".join(str(row.get(k,"")).strip() for k in ("title","selftext","body") if str(row.get(k,"")).strip()).strip()
+                    raw = joined if joined else None
+                if not raw: continue
+                title = (row.get("title") or "")
+                post = prepare_post(raw, title)
+                if not post: continue
+                emit_example(f"Post: {post}\nTask: Identify which mental health condition this post is about.\nAnswer: ADHD<|endoftext|>")
 
-# ----------------------------
-# DSM-5 knowledge injection (optional)
-# ----------------------------
-if args.include_dsm and Path(args.dsm_file).exists():
-    print(f"[+] Injecting DSM-5 knowledge from {args.dsm_file}")
-    lines = Path(args.dsm_file).read_text(encoding="utf-8", errors="ignore").splitlines()
-    disorder, bucket = None, []
+# ---------------------------
+# DSM-5 injection
+# ---------------------------
+def inject_dsm():
+    p = Path(args.dsm_file)
+    if not args.include_dsm:
+        print("[*] DSM-5 injection disabled."); return
+    if not p.is_file():
+        print(f"[!] DSM-5 file not found at {p}; skipping DSM injection."); return
+    print(f"[+] Injecting DSM-5 knowledge from {p}")
+    with p.open('r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    disorder = None; bucket=[]
     def flush():
         if disorder and bucket:
-            crit = " ".join([x for x in bucket if x]).strip()
+            crit = " ".join([x.strip() for x in bucket if x.strip()])
             if crit:
-                q = f"List the DSM-5 diagnostic criteria for {disorder}."
-                sample = maybe_emit("(DSM-5 Reference)", q, crit, "DSM5")
-                if sample: all_lines.append(sample)
+                post = "(DSM-5 Reference)"  # also keywordized by pipeline (but keep as-is)
+                emit_example(f"Post: {keywordize_text(post)}\nTask: List the DSM-5 diagnostic criteria for {disorder}.\nAnswer: {crit}<|endoftext|>")
     for line in lines:
-        if line.strip() and line.isupper() and len(line.split())<10:
-            flush(); disorder = line.strip().title(); bucket=[]
+        if line.isupper() and line.strip() and len(line.split()) < 10:
+            flush()
+            disorder = line.strip().title()
+            bucket = []
         else:
-            if disorder: bucket.append(line.strip())
+            if disorder:
+                bucket.append(line)
     flush()
-else:
-    if args.include_dsm:
-        print(f"[!] DSM file not found at {args.dsm_file}; skipping injection.")
 
-# ----------------------------
-# Shuffle, split, write
-# ----------------------------
-if not args.no_shuffle:
-    random.seed(args.seed); random.shuffle(all_lines)
+# ---------------------------
+# Run all datasets
+# ---------------------------
+try:
+    run_kamaruladha()
+    run_bipolar()
+    run_anxiety_binary()
+    run_dreaddit()
+    run_neel()
+    run_social_anxiety()
+    run_rmhd()
+    run_cid007()
+    run_panic()
+    run_adhd()
+    inject_dsm()
+finally:
+    train_f.close()
+    val_f.close()
 
-n_total = len(all_lines)
-n_val = max(1, int(n_total * args.val_ratio))
-val_lines = all_lines[:n_val]
-train_lines = all_lines[n_val:]
+# ---------------------------
+# Tokenize to .bin (automatic)
+# ---------------------------
+tokenize_text_file_to_bin(train_path)
+tokenize_text_file_to_bin(val_path)
 
-with train_out.open("w", encoding="utf-8") as ft:
-    for s in train_lines: ft.write(s + "\n")
-with val_out.open("w", encoding="utf-8") as fv:
-    for s in val_lines: fv.write(s + "\n")
-
-rej_fp.close()
-print(f"[ok] train={train_out} | val={val_out}")
-
-# ----------------------------
-# Streaming tokenization to .bin (no token cap, low RAM)
-# ----------------------------
-def stream_tokenize_txt_to_bin(txt_path: Path, bin_path: Path):
-    if GPT2TokenizerFast is None:
-        raise RuntimeError("transformers not installed; required for tokenization")
-    tok = GPT2TokenizerFast.from_pretrained("gpt2")
-    # silence context warnings; we only emit ids, no forward pass
-    tok.model_max_length = int(1e30)
-    tok.init_kwargs["model_max_length"] = tok.model_max_length
-
-    # write in streaming manner
-    with txt_path.open("r", encoding="utf-8") as fin, open(bin_path, "wb") as fout:
-        count = 0
-        for line in fin:
-            ids = tok.encode(line, add_special_tokens=False)
-            if ids:
-                np.asarray(ids, dtype=np.uint16).tofile(fout)
-                count += len(ids)
-                if count and count % 5_000_000 == 0:
-                    print(f"  ... wrote ~{count:,} tokens to {bin_path.name}")
-    print(f"[ok] wrote {bin_path} (tokens ≈ {count:,})")
-
-train_bin = train_out.with_suffix(".bin")
-val_bin   = val_out.with_suffix(".bin")
-print(f"[tokenize] {train_out} -> {train_bin} (streaming, no token cap)")
-stream_tokenize_txt_to_bin(train_out, train_bin)
-print(f"[tokenize] {val_out} -> {val_bin} (streaming, no token cap)")
-stream_tokenize_txt_to_bin(val_out, val_bin)
+print("[done] all steps complete.")
