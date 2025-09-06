@@ -5,18 +5,22 @@ RAM-first + parallel data prep for mental-health corpora:
 - Cleans & keywordizes text (profanity/emoji stripping, spam filtering)
 - Merges multiple Kaggle datasets (full run by default, incl. RMHD)
 - Global shuffle + split into train/val
-- Parallel tokenization with GPT-2 tokenizer, packed to ctx=1024 blocks
+- Parallel tokenization with GPT-2 tokenizer, **strict cap to ctx=1024**,
+  and packing into fixed-size 1024 blocks suitable for llm.c
 
 Outputs:
   <train-out>.txt + <train-out>.bin
   <val-out>.txt   + <val-out>.bin
 """
 
-import os, sys, csv, re, json, math, argparse, hashlib, time
+import os, sys, csv, re, json, argparse, hashlib
 from pathlib import Path
 import random
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+
+# We control parallelism explicitly
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # ---------------------------
 # Optional libs
@@ -56,13 +60,12 @@ def build_argparser():
     p.add_argument('--val-ratio', type=float, default=0.10, help='Validation fraction (after dedupe).')
     p.add_argument('--seed',      type=int, default=42)
 
-    # parallelism (defaults tuned for i9-14900K)
-    p.add_argument('--workers', type=int, default=min(16, os.cpu_count() or 8),
-                   help='Threads for file parsing / dataset preparation.')
-    p.add_argument('--token-workers', type=int, default=min(24, (os.cpu_count() or 32) - 4),
-                   help='Processes for parallel tokenization.')
-    p.add_argument('--token-batch', type=int, default=2000,
-                   help='Lines per batch in each tokenization task.')
+    # parallelism (defaults are safe; on i9-14900K you can keep these)
+    cpu = os.cpu_count() or 8
+    p.add_argument('--workers', type=int, default=min(16, cpu),
+                   help='Threads for dataset parsing / row processing.')
+    p.add_argument('--token-workers', type=int, default=min(28, max(2, cpu - 4)),
+                   help='Processes for parallel tokenization (one tokenizer per process).')
 
     # DSM
     p.add_argument('--include-dsm', action='store_true', help='Inject DSM-5 Q&A from --dsm-file.')
@@ -83,16 +86,13 @@ def build_argparser():
     # dedupe / volume
     p.add_argument('--dedupe-cap', type=int, default=2_000_000, help='Max distinct items tracked for dedupe.')
     p.add_argument('--rmhd-seen-cap', type=int, default=600_000, help='Light dedupe cap for RMHD.')
-    # Full run is default: RMHD is included unless explicitly skipped.
     p.add_argument('--skip-rmhd', action='store_true', help='(Optional) Skip RMHD to move faster.')
-
-    # dataset caps (debugging/iteration)
     p.add_argument('--max-per-dataset', type=int, default=0, help='Optional cap per dataset (0 = no cap).')
 
-    # GPT-2 context packing
+    # GPT-2 context packing (default = 1024)
     p.add_argument('--ctx', type=int, default=1024, help='Pack tokens into blocks of this size (GPT-2=1024).')
     p.add_argument('--drop-last', action='store_true',
-                   help='If set, drop final partial block (< ctx tokens) when writing .bin.')
+                   help='Drop final partial block (< ctx tokens) when writing .bin.')
     return p
 
 
@@ -209,15 +209,6 @@ def strip_profanity_tokens(tokens):
         out.append(t)
     return out
 
-def dedupe_tokens(tokens):
-    if args.unique_keywords == 'off':
-        return tokens
-    seen = set(); out = []
-    for t in tokens:
-        if t in seen: continue
-        seen.add(t); out.append(t)
-    return out
-
 def keywordize_text(text: str) -> str:
     if not text:
         return ""
@@ -247,7 +238,8 @@ def keywordize_text(text: str) -> str:
         toks = [t for t in x.split() if t not in _STOP and len(t) > 1]
 
     toks = strip_profanity_tokens(toks)
-    toks = dedupe_tokens(toks)
+    if args.unique_keywords == 'on':
+        toks = list(dict.fromkeys(toks))  # per-post uniqueness
     if len(toks) < args.min_kw:
         return ""
     return " ".join(toks)
@@ -269,9 +261,21 @@ def prepare_post(raw_text: str, title: str = "") -> str | None:
 def sample_line(post: str, task: str, answer: str) -> str:
     return f"Post: {post}\nTask: {task}\nAnswer: {answer}<|endoftext|>"
 
+def _parallel_rows(rows, fn, limit=0, workers=8):
+    """Apply fn(row)->list[str] in parallel and flatten; respect optional cap."""
+    out = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(fn, r) for r in rows]
+        for fut in as_completed(futs):
+            part = fut.result() or []
+            out.extend(part)
+            if limit and len(out) >= limit:
+                return out[:limit]
+    return out if not limit else out[:limit]
+
 
 # ---------------------------
-# Dataset builders (return list[str])
+# Dataset builders (return list[str]) — each row processed in parallel
 # ---------------------------
 def ds_kamaruladha(maxn=0):
     slug = "kamaruladha/mental-disorders-identification-reddit-nlp"
@@ -280,20 +284,20 @@ def ds_kamaruladha(maxn=0):
     csvs = sorted(d.glob("*.csv"))
     if not csvs: return []
     rows = read_csv_any(csvs[0])
-    out = []
-    for row in rows:
+
+    def proc(row):
         text = (row.get('text') or row.get('body') or row.get('post') or "")
         title = (row.get('title') or "")
         post = prepare_post(text, title)
-        if not post: continue
+        if not post: return []
         label = (row.get('subreddit') or row.get('label') or "").strip()
-        if not label: continue
+        if not label: return []
         low = label.lower()
         mapping = {"adhd":"ADHD","ptsd":"PTSD","ocd":"OCD"}
         label = mapping.get(low, label.capitalize() if low==label else label)
-        out.append(sample_line(post, "Identify which mental health condition this post is about.", label))
-        if maxn and len(out) >= maxn: break
-    return out
+        return [sample_line(post, "Identify which mental health condition this post is about.", label)]
+
+    return _parallel_rows(rows, proc, maxn, args.workers)
 
 def ds_bipolar(maxn=0):
     slug = "michellevp/mental-health-dataset-bipolar"
@@ -302,24 +306,25 @@ def ds_bipolar(maxn=0):
     f = next((p for p in d.glob("*") if p.suffix.lower() in (".csv",".xlsx")), None)
     if not f: return []
     rows = read_csv_any(f) if f.suffix.lower()==".csv" else (pd.read_excel(f).to_dict(orient="records") if pd else [])
-    out = []
-    for row in rows:
+
+    def proc(row):
         text = (row.get('text') or row.get('post') or row.get('content') or "")
         post = prepare_post(text)
-        if not post: continue
+        if not post: return []
         sent = (row.get('sentiment') or row.get('sentiment_label') or "")
-        if not str(sent).strip(): continue
+        if not str(sent).strip(): return []
         s = str(sent).lower()
         if s == '1' or 'pos' in s: sent = "Positive"
         elif s == '-1' or 'neg' in s: sent = "Negative"
         elif s == '0' or 'neu' in s: sent = "Neutral"
         else: sent = str(sent).capitalize()
-        out.append(sample_line(post, "Determine the sentiment expressed in the following bipolar discussion post.", sent))
+        out = [sample_line(post, "Determine the sentiment expressed in the following bipolar discussion post.", sent)]
         risk = (row.get('risk_factor') or "").strip()
         if risk:
             out.append(sample_line(post, "Identify any risk factor mentioned in the post.", risk))
-        if maxn and len(out) >= maxn: break
-    return out
+        return out
+
+    return _parallel_rows(rows, proc, maxn, args.workers)
 
 def ds_anxiety_binary(maxn=0):
     slug = "michellevp/predicting-anxiety-in-mental-health-data"
@@ -328,18 +333,18 @@ def ds_anxiety_binary(maxn=0):
     f = next((p for p in d.glob("*") if p.suffix.lower() in (".csv",".xlsx")), None)
     if not f: return []
     rows = read_csv_any(f) if f.suffix.lower()==".csv" else (pd.read_excel(f).to_dict(orient="records") if pd else [])
-    out = []
-    for r in rows:
+
+    def proc(r):
         text = (r.get('text') or r.get('post') or r.get('content') or "")
         post = prepare_post(text)
-        if not post: continue
+        if not post: return []
         val = (r.get('anxiety') or r.get('label') or r.get('class') or "")
         val = str(val).strip().lower()
-        if not val: continue
+        if not val: return []
         ans = "Yes" if val in ("1","true","yes","anxiety") else "No"
-        out.append(sample_line(post, "Does the following post indicate an anxiety disorder? Answer Yes or No.", ans))
-        if maxn and len(out) >= maxn: break
-    return out
+        return [sample_line(post, "Does the following post indicate an anxiety disorder? Answer Yes or No.", ans)]
+
+    return _parallel_rows(rows, proc, maxn, args.workers)
 
 def ds_dreaddit(maxn=0):
     slug = "shuvojitdas/stress-analysis"
@@ -347,18 +352,19 @@ def ds_dreaddit(maxn=0):
     kaggle_download(slug, d)
     files = list(d.glob("*.csv")) or list(d.glob("*.tsv"))
     if not files: return []
-    out = []
+    rows = []
     for f in files:
-        for row in read_csv_any(f):
-            text = (row.get('text') or row.get('post') or row.get('body') or "")
-            post = prepare_post(text)
-            if not post: continue
-            lab = (row.get('label') or row.get('stress') or row.get('y') or "")
-            ans = "Yes" if str(lab).strip().lower() in ("1","yes","true","stressed") else "No"
-            out.append(sample_line(post, "Determine if the user is stressed in the following post. Answer Yes or No.", ans))
-            if maxn and len(out) >= maxn: break
-        if maxn and len(out) >= maxn: break
-    return out
+        rows.extend(read_csv_any(f))
+
+    def proc(row):
+        text = (row.get('text') or row.get('post') or row.get('body') or "")
+        post = prepare_post(text)
+        if not post: return []
+        lab = (row.get('label') or row.get('stress') or row.get('y') or "")
+        ans = "Yes" if str(lab).strip().lower() in ("1","yes","true","stressed") else "No"
+        return [sample_line(post, "Determine if the user is stressed in the following post. Answer Yes or No.", ans)]
+
+    return _parallel_rows(rows, proc, maxn, args.workers)
 
 def ds_neel(maxn=0):
     slug = "neelghoshal/reddit-mental-health-data"
@@ -366,23 +372,21 @@ def ds_neel(maxn=0):
     kaggle_download(slug, d)
     f = next((p for p in d.glob("*") if p.suffix.lower() in (".csv",".tsv")), None)
     if not f: return []
+    rows = read_csv_any(f)
     mapping = {'0':"Stress",'1':"Depression",'2':"Bipolar",'3':"Anxiety",'4':"PTSD"}
-    out = []
-    for row in read_csv_any(f):
+
+    def proc(row):
         text = (row.get('text') or row.get('post') or row.get('body') or "")
         post = prepare_post(text)
-        if not post: continue
+        if not post: return []
         lab = (row.get('target') or row.get('label') or row.get('class') or "")
         lab = str(lab).strip()
-        if not lab: continue
+        if not lab: return []
         name = mapping.get(lab, lab.capitalize())
-        out.append(sample_line(
-            post,
-            "Identify the mental health issue discussed in this post (Stress, Depression, Bipolar, Anxiety, or PTSD).",
-            name
-        ))
-        if maxn and len(out) >= maxn: break
-    return out
+        return [sample_line(post,
+                            "Identify the mental health issue discussed in this post (Stress, Depression, Bipolar, Anxiety, or PTSD).",
+                            name)]
+    return _parallel_rows(rows, proc, maxn, args.workers)
 
 def ds_social_anxiety(maxn=0):
     slug = "natezhang123/social-anxiety-dataset"
@@ -446,22 +450,22 @@ def ds_social_anxiety(maxn=0):
         return score
     feat_pool.sort(key=score_feat, reverse=True)
     chosen = feat_pool[:3]
-    out = []
-    for r in rows:
+
+    def proc(r):
         raw = r.get(label_col,"")
-        if raw is None or str(raw).strip()=="": continue
+        if raw is None or str(raw).strip()=="": return []
         sev = num2sev(_to_float(raw)) if numeric_vals and _to_float(raw) is not None else (cat2sev(str(raw)) if not numeric_vals else None)
-        if sev is None: continue
+        if sev is None: return []
         pieces=[]
         for fk in chosen:
             v = str(r.get(fk,"")).strip()
             if v and v.lower()!="nan": pieces.append(f"{fk}: {v}")
         desc = "; ".join(pieces) if pieces else "various lifestyle and screening features available"
         post = prepare_post(f"The individual reports: {desc}.")
-        if not post: continue
-        out.append(sample_line(post, "Classify the person's social anxiety level (None, Mild, Moderate, or Severe).", sev))
-        if maxn and len(out) >= maxn: break
-    return out
+        if not post: return []
+        return [sample_line(post, "Classify the person's social anxiety level (None, Mild, Moderate, or Severe).", sev)]
+
+    return _parallel_rows(rows, proc, maxn, args.workers)
 
 # ---- RMHD: parallel per file (threads) ----
 def _rmhd_process_file(path: Path, rmhd_seen_texts: set, seen_cap: int) -> list[str]:
@@ -518,13 +522,11 @@ def _rmhd_process_file(path: Path, rmhd_seen_texts: set, seen_cap: int) -> list[
             if not raw: continue
             post = prepare_post(raw, title)
             if not post: continue
-            # light dedupe
             if len(rmhd_seen_texts) < seen_cap:
                 if post in rmhd_seen_texts:
                     pass
                 else:
                     rmhd_seen_texts.add(post)
-            # disorder label
             disorder = None
             for k in ("subreddit","condition","category","label","mental_illness","diagnosis","target","class"):
                 v = row.get(k)
@@ -549,144 +551,11 @@ def ds_rmhd_parallel(maxn=0):
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futures = [ex.submit(_rmhd_process_file, p, rmhd_seen_texts, args.rmhd_seen_cap) for p in cands]
         for fut in as_completed(futures):
-            out.extend(fut.result() or [])
+            chunk = fut.result() or []
+            out.extend(chunk)
             if maxn and len(out) >= maxn:
-                break
+                return out[:maxn]
     return out if not maxn else out[:maxn]
-
-def ds_cid007(maxn=0):
-    slug = "cid007/mental-disorder-classification"
-    d = cache_dir / "mental_disorder_classification"
-    kaggle_download(slug, d)
-    pth = None
-    for ext in ("*.csv","*.tsv","*.xlsx"):
-        L = list(d.rglob(ext))
-        if L: pth = L[0]; break
-    if not pth: return []
-
-    rows = read_csv_any(pth) if pth.suffix.lower() in (".csv",".tsv") else (pd.read_excel(pth).to_dict(orient="records") if pd else [])
-    if not rows: return []
-    keys0 = list(rows[0].keys())
-    def norm(s): return s.lower().strip().replace(" ","_")
-    label_col = None
-    pref = ("diagnos","disorder","label","class","target","illness","condition","result")
-    for k in keys0:
-        if any(w in norm(k) for w in pref):
-            label_col = k; break
-    if not label_col and pd is not None:
-        dfh = pd.DataFrame(rows)
-        for k in keys0:
-            try:
-                u = dfh[k].nunique(dropna=True)
-                if 2 <= u <= 8 and not pd.api.types.is_numeric_dtype(dfh[k]): label_col = k; break
-            except Exception:
-                pass
-    if not label_col: return []
-
-    symptom_cols = [k for k in keys0 if k != label_col]
-    def clean_diag(x):
-        if x is None: return ""
-        low = str(x).strip().lower()
-        mp = {"normal":"Normal","anxiety":"Anxiety","depression":"Depression","bipolar":"Bipolar","ptsd":"PTSD","ocd":"OCD","adhd":"ADHD"}
-        return mp.get(low, str(x).strip().title())
-    def include_val(v):
-        if v is None: return False
-        s = str(v).strip().lower()
-        if s in ("","nan","none"): return False
-        try:
-            return float(s) > 0.0
-        except Exception:
-            return s in ("yes","true","present","high","mild","moderate","severe","1")
-
-    out = []
-    for r in rows:
-        diag = clean_diag(r.get(label_col,""))
-        if not diag: continue
-        pres = []
-        for c in symptom_cols:
-            if include_val(r.get(c,"")):
-                pres.append(str(c).replace("_"," ").strip().title())
-        if not pres and diag != "Normal": 
-            continue
-        if not pres and diag == "Normal":
-            pres = ["No significant psychiatric symptoms"]
-        post = prepare_post(f"Patient exhibits the following symptoms: {', '.join(pres[:6])}.")
-        if not post: continue
-        out.append(sample_line(post, "Determine the most likely diagnosis for this patient.", diag))
-        if maxn and len(out) >= maxn: break
-    return out
-
-def ds_panic(maxn=0):
-    slug = "muhammadshahidazeem/panic-disorder-detection-dataset"
-    d = cache_dir / "panic_disorder_detection"
-    kaggle_download(slug, d)
-    files = [p for p in d.glob("*") if p.suffix.lower() in (".csv",".tsv")]
-    if not files: return []
-    out = []
-    for f in files:
-        rows = read_csv_any(f)
-        if not rows: continue
-        k0 = list(rows[0].keys())
-        label_key = next((k for k in k0 if ("panic" in k.lower()) and any(x in k.lower() for x in ("label","disorder","target"))), None)
-        if not label_key:
-            label_key = k0[-1]
-        feat_keys = [k for k in k0 if k != label_key]
-        for r in rows:
-            lv = str(r.get(label_key,"")).strip().lower()
-            ans = "Yes" if lv in ("1","yes","true","panic") else "No"
-            parts=[]
-            for fk in feat_keys:
-                v = str(r.get(fk,"")).strip()
-                if not v or v.lower()=="nan": continue
-                low = fk.lower()
-                if low in ("age","gender","sex"):
-                    parts.append(f"{fk}: {v}")
-                elif low in ("symptom","symptoms","chest_pain","sweating","palpitations","dizziness"):
-                    if v in ("1","yes","true"): parts.append(f"{fk.replace('_',' ')}: yes")
-                if len(parts)>=5: break
-            if not parts: parts.append("no notable symptoms")
-            post = prepare_post(f"Patient data - {'; '.join(parts)}.")
-            if not post: continue
-            out.append(sample_line(post, "Is this a case of Panic Disorder? Answer Yes or No.", ans))
-            if maxn and len(out) >= maxn: break
-        if maxn and len(out) >= maxn: break
-    return out
-
-def ds_adhd(maxn=0):
-    slug = "jerseyneo/reddit-adhd-dataset"
-    d = cache_dir / "reddit_adhd_dataset"
-    kaggle_download(slug, d)
-    csvs = sorted(d.glob("*.csv"))
-    if not csvs: return []
-    candidate_fields = ("selftext","body","comment","text","content","message","post","description")
-    out = []
-    for p in csvs:
-        with p.open('r', encoding='utf-8', errors='ignore') as f:
-            sample = f.read(8192); f.seek(0)
-            try:
-                dialect = csv.Sniffer().sniff(sample)
-            except Exception:
-                dialect = csv.excel
-            reader = csv.DictReader(f, dialect=dialect)
-            for row in reader:
-                raw = None
-                for k in candidate_fields:
-                    v = row.get(k)
-                    if v and str(v).strip():
-                        raw = str(v); break
-                if not raw:
-                    joined = " ".join(str(row.get(k,"")).strip()
-                                      for k in ("title","selftext","body")
-                                      if str(row.get(k,"")).strip()).strip()
-                    raw = joined if joined else None
-                if not raw: continue
-                title = (row.get("title") or "")
-                post = prepare_post(raw, title)
-                if not post: continue
-                out.append(sample_line(post, "Identify which mental health condition this post is about.", "ADHD"))
-                if maxn and len(out) >= maxn: break
-        if maxn and len(out) >= maxn: break
-    return out
 
 
 # ---------------------------
@@ -722,75 +591,81 @@ def inject_dsm_lines():
 
 
 # ---------------------------
-# Tokenization (parallel, packed to ctx)
+# Tokenization (parallel, hard cap to ctx, packed to fixed ctx blocks)
 # ---------------------------
-def _tok_worker_init():
+def _tok_mp_init():
+    # one tokenizer per process
     global _TOK
-    _TOK = GPT2TokenizerFast.from_pretrained("gpt2")
+    from transformers import GPT2TokenizerFast as _GPTTok
+    _TOK = _GPTTok.from_pretrained("gpt2")
 
-def _tok_worker_batch(batch: list[str]) -> list[np.ndarray]:
-    """
-    Encode each input line to token IDs (uint16). Lines already contain <|endoftext|>,
-    which GPT-2 tokenizer maps to eos token id (50256). No manual EOS appending here.
-    """
-    ids_list = []
-    tok = _TOK  # created in initializer
-    for line in batch:
-        ids = tok.encode(line)
-        ids_list.append(np.asarray(ids, dtype=np.uint16))
-    return ids_list
+def _tok_mp_encode(lines_ctx):
+    lines, ctx_len = lines_ctx
+    enc = _TOK(lines, add_special_tokens=False, truncation=True, max_length=ctx_len)
+    # return list[list[int]] (each already <= ctx_len)
+    return [ids[:ctx_len] if len(ids) > ctx_len else ids for ids in enc["input_ids"]]
 
-def tokenize_lines_to_bin_packed(lines: list[str], bin_path: Path, token_workers: int, batch_size: int, ctx: int, drop_last: bool):
+def tokenize_lines_to_bin_packed(lines, out_bin_path: Path,
+                                 workers: int,
+                                 ctx_len: int, drop_last: bool):
+    """
+    Encode lines in parallel (process pool), **hard-cap to ctx_len** per sequence,
+    then pack into fixed-length ctx_len blocks for llm.c.
+
+    We split the input evenly across workers; with 64GB RAM this avoids micromanaging batch sizes.
+    """
     if GPT2TokenizerFast is None:
-        raise RuntimeError("transformers not installed (pip install transformers). Needed for tokenization.")
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
-    print(f"[tokenize] pack={ctx} -> {bin_path} using {token_workers} proc(s), batch={batch_size}")
-    t0 = time.time()
-    total_tokens = 0
-    written_blocks = 0
+        raise RuntimeError("transformers not installed (pip install transformers). Needed for .bin tokenization.")
 
-    with open(bin_path, 'wb') as fout:
-        # generate batches
-        batches = [lines[i:i+batch_size] for i in range(0, len(lines), batch_size)]
-        carry = np.empty(0, dtype=np.uint16)
+    n = len(lines)
+    if n == 0:
+        # still create an empty file
+        open(out_bin_path, 'wb').close()
+        print(f"[tokenize] {out_bin_path} | nothing to write")
+        return
 
-        with ProcessPoolExecutor(max_workers=token_workers, initializer=_tok_worker_init) as ex:
-            futures = [ex.submit(_tok_worker_batch, b) for b in batches]
-            done = 0
-            for fut in as_completed(futures):
-                arrs = fut.result()
-                for a in arrs:
-                    if carry.size == 0:
-                        cur = a
-                    else:
-                        cur = np.concatenate((carry, a), dtype=np.uint16)
+    w = max(1, workers)
+    # split roughly evenly into w slices (more tasks can be created by multiplying w if you want finer granularity)
+    splits = []
+    step = (n + w - 1) // w
+    for i in range(0, n, step):
+        splits.append(lines[i:i+step])
+    print(f"[tokenize] {out_bin_path} | ctx={ctx_len} | workers={w} | slices={len(splits)}")
 
-                    # write out full ctx-sized blocks
-                    n_full = cur.size // ctx
-                    if n_full > 0:
-                        to_write = cur[:n_full*ctx].reshape(-1, ctx)
-                        to_write.tofile(fout)
-                        total_tokens += int(n_full*ctx)
-                        written_blocks += int(n_full)
-                        cur = cur[n_full*ctx:]
+    all_token_seqs = []
+    with ProcessPoolExecutor(max_workers=w, initializer=_tok_mp_init) as ex:
+        futs = [ex.submit(_tok_mp_encode, (chunk, ctx_len)) for chunk in splits]
+        for fut in as_completed(futs):
+            all_token_seqs.extend(fut.result())
 
-                    # keep remainder as new carry
-                    carry = cur
+    # pack to fixed ctx blocks
+    buf = np.empty(ctx_len, dtype=np.uint16)
+    buf_len = 0
+    total_chunks = 0
+    max_seen = 0
 
-                done += 1
-                if done % 10 == 0:
-                    dt = time.time() - t0
-                    rate = (total_tokens/dt) if dt > 0 else 0
-                    print(f"  > batches done={done}/{len(batches)}  blocks={written_blocks:,}  tokens={total_tokens:,}  ~{rate:,.0f} tok/s")
+    with open(out_bin_path, 'wb') as fout:
+        for seq in all_token_seqs:
+            if len(seq) > ctx_len:
+                seq = seq[:ctx_len]  # defensive (shouldn’t trigger)
+            max_seen = max(max_seen, len(seq))
+            i = 0
+            while i < len(seq):
+                take = min(ctx_len - buf_len, len(seq) - i)
+                if take:
+                    buf[buf_len:buf_len+take] = np.asarray(seq[i:i+take], dtype=np.uint16)
+                    buf_len += take
+                    i += take
+                if buf_len == ctx_len:
+                    buf.tofile(fout)
+                    total_chunks += 1
+                    buf_len = 0
 
-        # flush remainder
-        if carry.size and not drop_last:
-            # write the leftover partial block (not padded)
-            carry.tofile(fout)
-            total_tokens += int(carry.size)
+        if buf_len and not drop_last:
+            buf[:buf_len].tofile(fout)
+            total_chunks += 1
 
-    dt = time.time() - t0
-    print(f"[tokenize done] tokens={total_tokens:,}  blocks(={ctx})={written_blocks:,}  time={dt:,.1f}s")
+    print(f"[tokenize] wrote {total_chunks} chunk(s); max per-seq length observed = {max_seen} (≤ {ctx_len})")
 
 
 # ---------------------------
@@ -830,6 +705,132 @@ def main():
         take(ds_rmhd_parallel, "RMHD (Entenam, parallel)")
     else:
         print("[*] Skipping RMHD as requested.")
+
+    # Optional additional sets
+    # (keep as separate calls so you can quickly comment any out)
+    # e.g., CID007 & Panic & ADHD:
+    def ds_cid007(maxn=0):
+        slug = "cid007/mental-disorder-classification"
+        d = cache_dir / "mental_disorder_classification"
+        kaggle_download(slug, d)
+        pth = None
+        for ext in ("*.csv","*.tsv","*.xlsx"):
+            L = list(d.rglob(ext))
+            if L: pth = L[0]; break
+        if not pth: return []
+        rows = read_csv_any(pth) if pth.suffix.lower() in (".csv",".tsv") else (pd.read_excel(pth).to_dict(orient="records") if pd else [])
+        if not rows: return []
+        keys0 = list(rows[0].keys())
+        def norm(s): return s.lower().strip().replace(" ","_")
+        label_col = None
+        pref = ("diagnos","disorder","label","class","target","illness","condition","result")
+        for k in keys0:
+            if any(w in norm(k) for w in pref):
+                label_col = k; break
+        if not label_col and pd is not None:
+            dfh = pd.DataFrame(rows)
+            for k in keys0:
+                try:
+                    u = dfh[k].nunique(dropna=True)
+                    if 2 <= u <= 8 and not pd.api.types.is_numeric_dtype(dfh[k]): label_col = k; break
+                except Exception:
+                    pass
+        if not label_col: return []
+        symptom_cols = [k for k in keys0 if k != label_col]
+        def clean_diag(x):
+            if x is None: return ""
+            low = str(x).strip().lower()
+            mp = {"normal":"Normal","anxiety":"Anxiety","depression":"Depression","bipolar":"Bipolar","ptsd":"PTSD","ocd":"OCD","adhd":"ADHD"}
+            return mp.get(low, str(x).strip().title())
+        def include_val(v):
+            if v is None: return False
+            s = str(v).strip().lower()
+            if s in ("","nan","none"): return False
+            try:
+                return float(s) > 0.0
+            except Exception:
+                return s in ("yes","true","present","high","mild","moderate","severe","1")
+        def proc(r):
+            diag = clean_diag(r.get(label_col,""))
+            if not diag: return []
+            pres = []
+            for c in symptom_cols:
+                if include_val(r.get(c,"")):
+                    pres.append(str(c).replace("_"," ").strip().title())
+            if not pres and diag != "Normal": 
+                return []
+            if not pres and diag == "Normal":
+                pres = ["No significant psychiatric symptoms"]
+            post = prepare_post(f"Patient exhibits the following symptoms: {', '.join(pres[:6])}.")
+            if not post: return []
+            return [sample_line(post, "Determine the most likely diagnosis for this patient.", diag)]
+        return _parallel_rows(rows, proc, maxn, args.workers)
+
+    def ds_panic(maxn=0):
+        slug = "muhammadshahidazeem/panic-disorder-detection-dataset"
+        d = cache_dir / "panic_disorder_detection"
+        kaggle_download(slug, d)
+        files = [p for p in d.glob("*") if p.suffix.lower() in (".csv",".tsv")]
+        if not files: return []
+        rows = []
+        for f in files:
+            rows.extend(read_csv_any(f))
+        def proc(r):
+            k0 = list(r.keys())
+            label_key = next((k for k in k0 if ("panic" in k.lower()) and any(x in k.lower() for x in ("label","disorder","target"))), None) or k0[-1]
+            lv = str(r.get(label_key,"")).strip().lower()
+            ans = "Yes" if lv in ("1","yes","true","panic") else "No"
+            parts=[]
+            for fk in k0:
+                if fk == label_key: continue
+                v = str(r.get(fk,"")).strip()
+                if not v or v.lower()=="nan": continue
+                low = fk.lower()
+                if low in ("age","gender","sex"):
+                    parts.append(f"{fk}: {v}")
+                elif low in ("symptom","symptoms","chest_pain","sweating","palpitations","dizziness"):
+                    if v in ("1","yes","true"): parts.append(f"{fk.replace('_',' ')}: yes")
+                if len(parts)>=5: break
+            if not parts: parts.append("no notable symptoms")
+            post = prepare_post(f"Patient data - {'; '.join(parts)}.")
+            if not post: return []
+            return [sample_line(post, "Is this a case of Panic Disorder? Answer Yes or No.", ans)]
+        return _parallel_rows(rows, proc, maxn, args.workers)
+
+    def ds_adhd(maxn=0):
+        slug = "jerseyneo/reddit-adhd-dataset"
+        d = cache_dir / "reddit_adhd_dataset"
+        kaggle_download(slug, d)
+        csvs = sorted(d.glob("*.csv"))
+        if not csvs: return []
+        rows = []
+        for pth in csvs:
+            with pth.open('r', encoding='utf-8', errors='ignore') as f:
+                sample = f.read(8192); f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample)
+                except Exception:
+                    dialect = csv.excel
+                rows.extend(list(csv.DictReader(f, dialect=dialect)))
+        candidate_fields = ("selftext","body","comment","text","content","message","post","description")
+        def proc(row):
+            raw = None
+            for k in candidate_fields:
+                v = row.get(k)
+                if v and str(v).strip():
+                    raw = str(v); break
+            if not raw:
+                joined = " ".join(str(row.get(k,"")).strip()
+                                  for k in ("title","selftext","body")
+                                  if str(row.get(k,"")).strip()).strip()
+                raw = joined if joined else None
+            if not raw: return []
+            title = (row.get("title") or "")
+            post = prepare_post(raw, title)
+            if not post: return []
+            return [sample_line(post, "Identify which mental health condition this post is about.", "ADHD")]
+        return _parallel_rows(rows, proc, maxn, args.workers)
+
     take(ds_cid007,      "CID007 (symptom→diagnosis)")
     take(ds_panic,       "Panic disorder detection")
     take(ds_adhd,        "Reddit ADHD (jerseyneo)")
@@ -869,11 +870,11 @@ def main():
     val_path.write_text("\n".join(val_lines) + "\n", encoding="utf-8")
     print(f"[write] {train_path} , {val_path}")
 
-    # --- Tokenize in parallel, packed to ctx (GPT-2 default = 1024) ---
+    # --- Tokenize in parallel, **strictly capped to ctx**, packed into fixed ctx chunks ---
     tokenize_lines_to_bin_packed(train_lines, train_path.with_suffix(".bin"),
-                                 args.token_workers, args.token_batch, args.ctx, args.drop_last)
+                                 args.token_workers, args.ctx, args.drop_last)
     tokenize_lines_to_bin_packed(val_lines,   val_path.with_suffix(".bin"),
-                                 max(2, args.token_workers//2), args.token_batch, args.ctx, args.drop_last)
+                                 max(2, args.token_workers//2), args.ctx, args.drop_last)
 
     print("[done] all steps complete.")
 
