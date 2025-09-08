@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 RAM-first + parallel data prep for mental-health corpora:
-- Cleans & keywordizes text (profanity/emoji stripping, spam filtering)
-- Merges multiple Kaggle datasets (full run by default, incl. RMHD)
+- Cleans text minimally (URL/email/mention/hashtag removal, whitespace normalize)
+- (Default) No keywordization to avoid distribution shift
+- Merges 10 Kaggle datasets (full run by default, incl. RMHD)
 - Global shuffle + split into train/val
-- Parallel tokenization to two formats:
-    * GPT-2 via tiktoken (strict cap ctx=1024, uint16, fixed-size blocks)
-    * Llama-3 via HF AutoTokenizer (strict cap ctx=1024, uint32, fixed-size blocks)
+- Parallel tokenization to two formats with strict ctx=1024:
+    * GPT-2 via tiktoken (uint16) with EOS appended
+    * Llama-3 via HF AutoTokenizer (uint32) with BOS/EOS
 
 Datasets:
   - kamaruladha/mental-disorders-identification-reddit-nlp
@@ -82,28 +83,28 @@ def build_argparser():
     p.add_argument('--val-ratio', type=float, default=0.10, help='Validation fraction (after dedupe).')
     p.add_argument('--seed',      type=int, default=42)
 
-    # parallelism (safe defaults; your i9 can go higher)
+    # parallelism (safe defaults; on i9-14900K you can push higher)
     cpu = os.cpu_count() or 8
     p.add_argument('--workers', type=int, default=min(16, cpu),
                    help='Threads for dataset parsing / row processing.')
     p.add_argument('--token-workers', type=int, default=min(28, max(2, cpu - 4)),
-                   help='Processes per tokenizer (GPT-2 and Llama each use up to this many).')
+                   help='Processes used by each tokenizer (GPT-2 and Llama).')
 
     # DSM
     p.add_argument('--include-dsm', action='store_true', help='Inject DSM-5 Q&A from --dsm-file.')
     p.add_argument('--dsm-file',  type=str, default='dataset/DSM-5.txt')
 
     # cleaning / keywordization
-    p.add_argument('--keywordize', choices=['simple', 'spacy'], default='simple',
-                   help="Keywordization strategy.")
-    p.add_argument('--strip-profanity', choices=['on','off'], default='on',
-                   help="Remove profane tokens (custom list + better_profanity if installed).")
+    p.add_argument('--keywordize', choices=['off', 'simple', 'spacy'], default='off',
+                   help="OFF (default) keeps natural text; 'simple'/'spacy' create lemma-style text (not recommended for FT).")
+    p.add_argument('--strip-profanity', choices=['on','off'], default='off',
+                   help="Remove profane tokens (may harm supervision in this domain).")
     p.add_argument('--profanity-file', type=str, default=None,
                    help="Path to custom profanity list (one word per line).")
-    p.add_argument('--strip-emojis', choices=['on','off'], default='on', help="Remove emoji/pictographs.")
-    p.add_argument('--unique-keywords', choices=['on','off'], default='on', help="Unique tokens per post.")
+    p.add_argument('--strip-emojis', choices=['on','off'], default='off', help="Remove emoji/pictographs.")
     p.add_argument('--min-chars', type=int, default=20, help='Min raw chars before cleaning.')
-    p.add_argument('--min-kw', type=int, default=3, help='Min keyword count after keywordization.')
+    p.add_argument('--min-kw', type=int, default=3, help='Min keyword count if keywordize != off.')
+    p.add_argument('--unique-keywords', choices=['on','off'], default='on', help='Unique tokens per post (keywordize modes only).')
 
     # dedupe / volume
     p.add_argument('--dedupe-cap', type=int, default=2_000_000, help='Max distinct items tracked for dedupe.')
@@ -208,8 +209,8 @@ def init_filters():
         try:
             _spacy_nlp = spacy.load('en_core_web_sm', disable=['ner','textcat'])
         except Exception:
-            print("[warn] spaCy model not available; falling back to 'simple'")
-            args.keywordize = 'simple'
+            print("[warn] spaCy model not available; falling back to 'off'")
+            args.keywordize = 'off'
 
 def is_spammy_raw(x: str) -> bool:
     if not x or len(x) < args.min_chars:
@@ -235,7 +236,8 @@ def strip_profanity_tokens(tokens):
         out.append(t)
     return out
 
-def keywordize_text(text: str) -> str:
+def safe_clean_text(text: str) -> str:
+    """Minimal cleaning to preserve natural distribution."""
     if not text:
         return ""
     x = str(text)
@@ -245,12 +247,19 @@ def keywordize_text(text: str) -> str:
     x = _HASHTAG_RE.sub(' ', x)
     if args.strip_emojis == 'on':
         x = _EMOJI_RE.sub(' ', x)
-    x = x.lower()
+    # keep case & punctuation; just collapse whitespace
+    x = _MULTI_WS_RE.sub(' ', x).strip()
+    return x
+
+def keywordize_text(text: str) -> str:
+    """Optional keywordization (not recommended for FT)."""
+    if not text:
+        return ""
+    x = text.lower()
     x = _NONWORD_RE.sub(' ', x)
     x = _MULTI_WS_RE.sub(' ', x).strip()
     if not x:
         return ""
-
     if args.keywordize == 'spacy' and _spacy_nlp is not None:
         doc = _spacy_nlp(x)
         toks = []
@@ -262,12 +271,9 @@ def keywordize_text(text: str) -> str:
             toks.append(lemma)
     else:
         toks = [t for t in x.split() if t not in _STOP and len(t) > 1]
-
     toks = strip_profanity_tokens(toks)
-    if args.unique-keywords if False else False:  # placeholder to avoid linter confusion (will be ignored)
-        pass
     if args.unique_keywords == 'on':
-        toks = list(dict.fromkeys(toks))  # per-post uniqueness
+        toks = list(dict.fromkeys(toks))
     if len(toks) < args.min_kw:
         return ""
     return " ".join(toks)
@@ -280,15 +286,19 @@ def prepare_post(raw_text: str, title: str = "") -> str | None:
         full = f"{title.strip()}\n{raw_text}"
     if is_spammy_raw(full):
         return None
-    full = " ".join(full.split())
-    kw_text = keywordize_text(full)
-    if not kw_text:
-        return None
-    return kw_text
+    full = " ".join(full.split())  # collapse interior whitespace/newlines a bit
+
+    if args.keywordize == 'off':
+        cleaned = safe_clean_text(full)
+        return cleaned if cleaned else None
+    else:
+        kw_text = keywordize_text(full)
+        return kw_text if kw_text else None
 
 def sample_line(post: str, task: str, answer: str) -> str:
-    # textual <|endoftext|> is appended for human readability; tokenizers replace it with real EOS
-    return f"Post: {post}\nTask: {task}\nAnswer: {answer}<|endoftext|>"
+    # No textual <|endoftext|> here. True EOS/BOS handled in tokenizers.
+    return f"Post: {post}\nTask: {task}\nAnswer: {answer}"
+
 
 def _parallel_rows(rows, fn, limit=0, workers=8):
     """Apply fn(row)->list[str] in parallel and flatten; respect optional cap."""
@@ -578,7 +588,7 @@ def ds_rmhd_parallel(maxn=0):
     rmhd_seen_texts = set()
     out = []
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = [ex.submit(_rmhd_process_file, p, rmhd_seen_texts, args.rmhd_seen_cap) for p in cands]
+        futures = [ex.submit(_rmhd_process_file, p, rmhd_seen_texts, args.rmhd_seenn_cap if False else args.rmhd_seen_cap) for p in cands]
         for fut in as_completed(futures):
             chunk = fut.result() or []
             out.extend(chunk)
@@ -588,7 +598,133 @@ def ds_rmhd_parallel(maxn=0):
 
 
 # ---------------------------
-# DSM-5 injection
+# Additional datasets (your list requires these too)
+# ---------------------------
+def ds_cid007(maxn=0):
+    slug = "cid007/mental-disorder-classification"
+    d = cache_dir / "mental_disorder_classification"
+    kaggle_download(slug, d)
+    pth = None
+    for ext in ("*.csv","*.tsv","*.xlsx"):
+        L = list(d.rglob(ext))
+        if L: pth = L[0]; break
+    if not pth: return []
+    rows = read_csv_any(pth) if pth.suffix.lower() in (".csv",".tsv") else (pd.read_excel(pth).to_dict(orient="records") if pd else [])
+    if not rows: return []
+    keys0 = list(rows[0].keys())
+    def norm(s): return s.lower().strip().replace(" ","_")
+    label_col = None
+    pref = ("diagnos","disorder","label","class","target","illness","condition","result")
+    for k in keys0:
+        if any(w in norm(k) for w in pref):
+            label_col = k; break
+    if not label_col and pd is not None:
+        dfh = pd.DataFrame(rows)
+        for k in keys0:
+            try:
+                u = dfh[k].nunique(dropna=True)
+                if 2 <= u <= 8 and not pd.api.types.is_numeric_dtype(dfh[k]): label_col = k; break
+            except Exception:
+                pass
+    if not label_col: return []
+    symptom_cols = [k for k in keys0 if k != label_col]
+    def clean_diag(x):
+        if x is None: return ""
+        low = str(x).strip().lower()
+        mp = {"normal":"Normal","anxiety":"Anxiety","depression":"Depression","bipolar":"Bipolar","ptsd":"PTSD","ocd":"OCD","adhd":"ADHD"}
+        return mp.get(low, str(x).strip().title())
+    def include_val(v):
+        if v is None: return False
+        s = str(v).strip().lower()
+        if s in ("","nan","none"): return False
+        try:
+            return float(s) > 0.0
+        except Exception:
+            return s in ("yes","true","present","high","mild","moderate","severe","1")
+    def proc(r):
+        diag = clean_diag(r.get(label_col,""))
+        if not diag: return []
+        pres = []
+        for c in symptom_cols:
+            if include_val(r.get(c,"")):
+                pres.append(str(c).replace("_"," ").strip().title())
+        if not pres and diag != "Normal": 
+            return []
+        if not pres and diag == "Normal":
+            pres = ["No significant psychiatric symptoms"]
+        post = prepare_post(f"Patient exhibits the following symptoms: {', '.join(pres[:6])}.")
+        if not post: return []
+        return [sample_line(post, "Determine the most likely diagnosis for this patient.", diag)]
+    return _parallel_rows(rows, proc, maxn, args.workers)
+
+def ds_panic(maxn=0):
+    slug = "muhammadshahidazeem/panic-disorder-detection-dataset"
+    d = cache_dir / "panic_disorder_detection"
+    kaggle_download(slug, d)
+    files = [p for p in d.glob("*") if p.suffix.lower() in (".csv",".tsv")]
+    if not files: return []
+    rows = []
+    for f in files:
+        rows.extend(read_csv_any(f))
+    def proc(r):
+        k0 = list(r.keys())
+        label_key = next((k for k in k0 if ("panic" in k.lower()) and any(x in k.lower() for x in ("label","disorder","target"))), None) or k0[-1]
+        lv = str(r.get(label_key,"")).strip().lower()
+        ans = "Yes" if lv in ("1","yes","true","panic") else "No"
+        parts=[]
+        for fk in k0:
+            if fk == label_key: continue
+            v = str(r.get(fk,"")).strip()
+            if not v or v.lower()=="nan": continue
+            low = fk.lower()
+            if low in ("age","gender","sex"):
+                parts.append(f"{fk}: {v}")
+            elif low in ("symptom","symptoms","chest_pain","sweating","palpitations","dizziness"):
+                if v in ("1","yes","true"): parts.append(f"{fk.replace('_',' ')}: yes")
+            if len(parts)>=5: break
+        if not parts: parts.append("no notable symptoms")
+        post = prepare_post(f"Patient data - {'; '.join(parts)}.")
+        if not post: return []
+        return [sample_line(post, "Is this a case of Panic Disorder? Answer Yes or No.", ans)]
+    return _parallel_rows(rows, proc, maxn, args.workers)
+
+def ds_adhd(maxn=0):
+    slug = "jerseyneo/reddit-adhd-dataset"
+    d = cache_dir / "reddit_adhd_dataset"
+    kaggle_download(slug, d)
+    csvs = sorted(d.glob("*.csv"))
+    if not csvs: return []
+    rows = []
+    for pth in csvs:
+        with pth.open('r', encoding='utf-8', errors='ignore') as f:
+            sample = f.read(8192); f.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+            except Exception:
+                dialect = csv.excel
+            rows.extend(list(csv.DictReader(f, dialect=dialect)))
+    candidate_fields = ("selftext","body","comment","text","content","message","post","description")
+    def proc(row):
+        raw = None
+        for k in candidate_fields:
+            v = row.get(k)
+            if v and str(v).strip():
+                raw = str(v); break
+        if not raw:
+            joined = " ".join(str(row.get(k,"")).strip()
+                              for k in ("title","selftext","body")
+                              if str(row.get(k,"")).strip()).strip()
+            raw = joined if joined else None
+        if not raw: return []
+        title = (row.get("title") or "")
+        post = prepare_post(raw, title)
+        if not post: return []
+        return [sample_line(post, "Identify which mental health condition this post is about.", "ADHD")]
+    return _parallel_rows(rows, proc, maxn, args.workers)
+
+
+# ---------------------------
+# DSM-5 injection (optional)
 # ---------------------------
 def inject_dsm_lines():
     if not args.include_dsm:
@@ -605,7 +741,7 @@ def inject_dsm_lines():
         if disorder and bucket:
             crit = " ".join([x.strip() for x in bucket if x.strip()])
             if crit:
-                post_kw = keywordize_text("(DSM-5 Reference)")
+                post_kw = safe_clean_text("(DSM-5 Reference)")
                 out.append(sample_line(post_kw, f"List the DSM-5 diagnostic criteria for {disorder}.", crit))
     for line in lines:
         if line.isupper() and line.strip() and len(line.split()) < 10:
@@ -627,32 +763,19 @@ def _split_slices(seq_len, workers):
     step = (seq_len + w - 1) // w
     return [(i, min(i+step, seq_len)) for i in range(0, seq_len, step)]
 
-def _strip_trailing_eot_text(s: str) -> str:
-    txt = s.rstrip()
-    suff = "<|endoftext|>"
-    if txt.endswith(suff):
-        return txt[:-len(suff)]
-    return txt
-
-# ---- GPT-2 via tiktoken (uint16) ----
 def _gpt2_worker_slice(args_tuple):
     lines_slice, ctx = args_tuple
-    import tiktoken  # type: ignore
+    import tiktoken  # local import inside worker process
     enc = tiktoken.get_encoding("gpt2")
     eot_id = enc._special_tokens.get("<|endoftext|>", 50256)
-    # pre-strip textual marker and append real EOT
-    base = [_strip_trailing_eot_text(s) for s in lines_slice]
-    try:
-        encoded = enc.encode_ordinary_batch(base)
-    except Exception:
-        encoded = [enc.encode_ordinary(s) for s in base]
-    enc_eot = []
-    for ids in encoded:
-        ids = ids[: max(0, ctx-1)]  # leave room for EOT
-        ids = ids + [eot_id]
+    out = []
+    # Encode each line, append EOS, and cap strictly to ctx
+    for s in lines_slice:
+        ids = enc.encode_ordinary(s)                 # natural text
+        ids = ids[: max(0, ctx-1)] + [eot_id]        # leave room for EOS
         if len(ids) > ctx: ids = ids[:ctx]
-        enc_eot.append(ids)
-    return enc_eot
+        out.append(ids)
+    return out
 
 def tokenize_to_bin_gpt2(lines, out_bin_path: Path, ctx_len: int, workers: int, drop_last: bool):
     if tiktoken is None:
@@ -693,21 +816,21 @@ def tokenize_to_bin_gpt2(lines, out_bin_path: Path, ctx_len: int, workers: int, 
 
 # ---- Llama-3 via HF AutoTokenizer (uint32) ----
 def _llama_worker_init(tokenizer_id: str):
-    global _LLTOK, _LLEOS
-    from transformers import AutoTokenizer as _AT  # type: ignore
+    global _LLTOK, _LLEOS, _LLBOS
+    from transformers import AutoTokenizer as _AT  # local import in worker
     _LLTOK = _AT.from_pretrained(tokenizer_id)
     _LLEOS = _LLTOK.eos_token_id if _LLTOK.eos_token_id is not None else _LLTOK.encode('')[0]
+    _LLBOS = _LLTOK.bos_token_id if _LLTOK.bos_token_id is not None else _LLTOK.encode(' ')[0]
 
 def _llama_worker_slice(lines_ctx):
     lines_slice, ctx = lines_ctx
-    base = [_strip_trailing_eot_text(s) for s in lines_slice]
-    enc = _LLTOK(base, add_special_tokens=False, truncation=True, max_length=max(1, ctx-1))
+    # leave room for BOS/EOS -> truncate to ctx-2 first
+    enc = _LLTOK(lines_slice, add_special_tokens=False, truncation=True, max_length=max(1, ctx-2))
     out = []
     for ids in enc["input_ids"]:
-        ids = ids[: max(0, ctx-1)]
-        ids = ids + [_LLEOS]
-        if len(ids) > ctx: ids = ids[:ctx]
-        out.append(ids)
+        seq = ([_LLBOS] if _LLBOS is not None else []) + ids[:max(0, ctx-2)] + ([_LLEOS] if _LLEOS is not None else [])
+        if len(seq) > ctx: seq = seq[:ctx]
+        out.append(seq)
     return out
 
 def tokenize_to_bin_llama(lines, out_bin_path: Path, ctx_len: int, workers: int, drop_last: bool, tokenizer_id: str):
@@ -726,7 +849,7 @@ def tokenize_to_bin_llama(lines, out_bin_path: Path, ctx_len: int, workers: int,
         for fut in as_completed(futs):
             all_ids.extend(fut.result())
 
-    # pack into fixed ctx blocks (uint32 because llama vocab > 65535)
+    # pack into fixed ctx blocks (uint32)
     buf = np.empty(ctx_len, dtype=np.uint32)
     buf_len = 0
     chunks = 0
@@ -786,135 +909,6 @@ def main():
         take(ds_rmhd_parallel, "RMHD (Entenam, parallel per-file)")
     else:
         print("[*] Skipping RMHD as requested.")
-
-    # Additional three (still required in your list)
-    take(  # cid007
-        (lambda m=0: (
-            (lambda: None)()
-        )), "placeholder")  # this line ensures function scope in editors
-
-    def ds_cid007(maxn=0):
-        slug = "cid007/mental-disorder-classification"
-        d = cache_dir / "mental_disorder_classification"
-        kaggle_download(slug, d)
-        pth = None
-        for ext in ("*.csv","*.tsv","*.xlsx"):
-            L = list(d.rglob(ext))
-            if L: pth = L[0]; break
-        if not pth: return []
-        rows = read_csv_any(pth) if pth.suffix.lower() in (".csv",".tsv") else (pd.read_excel(pth).to_dict(orient="records") if pd else [])
-        if not rows: return []
-        keys0 = list(rows[0].keys())
-        def norm(s): return s.lower().strip().replace(" ","_")
-        label_col = None
-        pref = ("diagnos","disorder","label","class","target","illness","condition","result")
-        for k in keys0:
-            if any(w in norm(k) for w in pref):
-                label_col = k; break
-        if not label_col and pd is not None:
-            dfh = pd.DataFrame(rows)
-            for k in keys0:
-                try:
-                    u = dfh[k].nunique(dropna=True)
-                    if 2 <= u <= 8 and not pd.api.types.is_numeric_dtype(dfh[k]): label_col = k; break
-                except Exception:
-                    pass
-        if not label_col: return []
-        symptom_cols = [k for k in keys0 if k != label_col]
-        def clean_diag(x):
-            if x is None: return ""
-            low = str(x).strip().lower()
-            mp = {"normal":"Normal","anxiety":"Anxiety","depression":"Depression","bipolar":"Bipolar","ptsd":"PTSD","ocd":"OCD","adhd":"ADHD"}
-            return mp.get(low, str(x).strip().title())
-        def include_val(v):
-            if v is None: return False
-            s = str(v).strip().lower()
-            if s in ("","nan","none"): return False
-            try:
-                return float(s) > 0.0
-            except Exception:
-                return s in ("yes","true","present","high","mild","moderate","severe","1")
-        def proc(r):
-            diag = clean_diag(r.get(label_col,""))
-            if not diag: return []
-            pres = []
-            for c in symptom_cols:
-                if include_val(r.get(c,"")):
-                    pres.append(str(c).replace("_"," ").strip().title())
-            if not pres and diag != "Normal": 
-                return []
-            if not pres and diag == "Normal":
-                pres = ["No significant psychiatric symptoms"]
-            post = prepare_post(f"Patient exhibits the following symptoms: {', '.join(pres[:6])}.")
-            if not post: return []
-            return [sample_line(post, "Determine the most likely diagnosis for this patient.", diag)]
-        return _parallel_rows(rows, proc, maxn, args.workers)
-
-    def ds_panic(maxn=0):
-        slug = "muhammadshahidazeem/panic-disorder-detection-dataset"
-        d = cache_dir / "panic_disorder_detection"
-        kaggle_download(slug, d)
-        files = [p for p in d.glob("*") if p.suffix.lower() in (".csv",".tsv")]
-        if not files: return []
-        rows = []
-        for f in files:
-            rows.extend(read_csv_any(f))
-        def proc(r):
-            k0 = list(r.keys())
-            label_key = next((k for k in k0 if ("panic" in k.lower()) and any(x in k.lower() for x in ("label","disorder","target"))), None) or k0[-1]
-            lv = str(r.get(label_key,"")).strip().lower()
-            ans = "Yes" if lv in ("1","yes","true","panic") else "No"
-            parts=[]
-            for fk in k0:
-                if fk == label_key: continue
-                v = str(r.get(fk,"")).strip()
-                if not v or v.lower()=="nan": continue
-                low = fk.lower()
-                if low in ("age","gender","sex"):
-                    parts.append(f"{fk}: {v}")
-                elif low in ("symptom","symptoms","chest_pain","sweating","palpitations","dizziness"):
-                    if v in ("1","yes","true"): parts.append(f"{fk.replace('_',' ')}: yes")
-                if len(parts)>=5: break
-            if not parts: parts.append("no notable symptoms")
-            post = prepare_post(f"Patient data - {'; '.join(parts)}.")
-            if not post: return []
-            return [sample_line(post, "Is this a case of Panic Disorder? Answer Yes or No.", ans)]
-        return _parallel_rows(rows, proc, maxn, args.workers)
-
-    def ds_adhd(maxn=0):
-        slug = "jerseyneo/reddit-adhd-dataset"
-        d = cache_dir / "reddit_adhd_dataset"
-        kaggle_download(slug, d)
-        csvs = sorted(d.glob("*.csv"))
-        if not csvs: return []
-        rows = []
-        for pth in csvs:
-            with pth.open('r', encoding='utf-8', errors='ignore') as f:
-                sample = f.read(8192); f.seek(0)
-                try:
-                    dialect = csv.Sniffer().sniff(sample)
-                except Exception:
-                    dialect = csv.excel
-                rows.extend(list(csv.DictReader(f, dialect=dialect)))
-        candidate_fields = ("selftext","body","comment","text","content","message","post","description")
-        def proc(row):
-            raw = None
-            for k in candidate_fields:
-                v = row.get(k)
-                if v and str(v).strip():
-                    raw = str(v); break
-            if not raw:
-                joined = " ".join(str(row.get(k,"")).strip()
-                                  for k in ("title","selftext","body")
-                                  if str(row.get(k,"")).strip()).strip()
-                raw = joined if joined else None
-            if not raw: return []
-            title = (row.get("title") or "")
-            post = prepare_post(raw, title)
-            if not post: return []
-            return [sample_line(post, "Identify which mental health condition this post is about.", "ADHD")]
-        return _parallel_rows(rows, proc, maxn, args.workers)
-
     take(ds_cid007,      "CID007 (symptom→diagnosis)")
     take(ds_panic,       "Panic disorder detection")
     take(ds_adhd,        "Reddit ADHD (jerseyneo)")
@@ -957,15 +951,15 @@ def main():
     # --- Dual tokenization, strict cap to ctx, packed into fixed ctx chunks ---
     # GPT-2 (tiktoken, uint16)
     tokenize_to_bin_gpt2(train_lines, train_path.with_suffix(".gpt2.bin"),
-                         args.ctx, args.token_workers, args.drop_last)
+                         args.ctx, max(1, args.token_workers), args.drop_last)
     tokenize_to_bin_gpt2(val_lines,   val_path.with_suffix(".gpt2.bin"),
-                         args.ctx, max(2, args.token_workers//2), args.drop_last)
+                         args.ctx, max(1, args.token_workers//2), args.drop_last)
 
     # Llama-3 (HF tokenizer, uint32)
     tokenize_to_bin_llama(train_lines, train_path.with_suffix(".llama3.bin"),
-                          args.ctx, args.token_workers, args.drop_last, args.llama_tokenizer)
+                          args.ctx, max(1, args.token_workers), args.drop_last, args.llama_tokenizer)
     tokenize_to_bin_llama(val_lines,   val_path.with_suffix(".llama3.bin"),
-                          args.ctx, max(2, args.token_workers//2), args.drop_last, args.llama_tokenizer)
+                          args.ctx, max(1, args.token_workers//2), args.drop_last, args.llama_tokenizer)
 
     print("[done] all steps complete.")
 
