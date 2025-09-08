@@ -1,20 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RAM-first + parallel data prep for mental-health corpora:
-- Cleans & keywordizes text (profanity/emoji stripping, spam filtering)
-- Merges multiple Kaggle datasets (full run by default, incl. RMHD)
-- Global shuffle + split into train/val
-- Parallel tokenization for BOTH GPT-2 (tiktoken) and Llama-3 (AutoTokenizer),
-  with a **strict cap to ctx=1024**, packed into fixed-size blocks.
+High-performance data prep + tokenizer for Kaggle mental-health corpora
 
-Outputs:
-  <train-out>.txt
-  <val-out>.txt
-  <train-out>.gpt2.bin    (uint16, 1024-packed)
-  <val-out>.gpt2.bin
-  <train-out>.llama3.bin  (uint32, 1024-packed)
-  <val-out>.llama3.bin
+What this script does
+---------------------
+1) Downloads & parses multiple Kaggle datasets (full run by default).
+2) Cleans & keywordizes text (URLs/emails/hashtags/emoji stripped, spam heuristics,
+   optional profanity removal via better_profanity + custom list, optional spaCy).
+3) Dedupe, global shuffle, split into train/val, and write .txt files.
+4) Tokenizes the text for BOTH GPT-2 (tiktoken, uint16) and Llama-3 (HF AutoTokenizer, uint32):
+   - Strict hard cap to ctx=1024 (default) per sequence
+   - Parallel, RAM-first encoding (process pool)
+   - Packs tokens into fixed-size blocks of length ctx, suitable for llm.c
+   - Writes per-model .bin files next to the .txt:
+        <train-out>_gpt2.bin,  <val-out>_gpt2.bin
+        <train-out>_llama3.bin,<val-out>_llama3.bin
+
+Examples
+--------
+# Full run with DSM-5 injection; defaults tuned for a fast desktop (i9 + lots of RAM)
+python high_perf_kaggle_tokenizers.py ^
+  --include-dsm --dsm-file "dataset/DSM-5.txt" ^
+  --workers 16 --token-workers 24 --ctx 1024
+
+# Skip RMHD (largest dataset) to iterate faster:
+python high_perf_kaggle_tokenizers.py --skip-rmhd --include-dsm
+
+Requirements
+------------
+pip install kaggle transformers tiktoken pandas numpy better_profanity spacy
+# (spaCy is optional; only used if --keywordize spacy)
+# If using --keywordize spacy:
+python -m spacy download en_core_web_sm
 """
 
 import os, sys, csv, re, json, argparse, hashlib
@@ -23,20 +41,20 @@ import random
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
-# don't let tokenizers spawn threads behind our back
+# Keep HF tokenizer threads under control (we parallelize at process level)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # ---------------------------
 # Optional libs
 # ---------------------------
 try:
-    import tiktoken
-except ImportError:
+    import tiktoken  # GPT-2 tokenizer
+except Exception:
     tiktoken = None
 
 try:
     from transformers import AutoTokenizer
-except ImportError:
+except Exception:
     AutoTokenizer = None
 
 try:
@@ -46,7 +64,7 @@ except Exception:
 
 try:
     from better_profanity import profanity as _bp
-except ImportError:
+except Exception:
     _bp = None
 
 try:
@@ -61,7 +79,7 @@ except Exception:
 # ---------------------------
 def build_argparser():
     p = argparse.ArgumentParser(
-        description="Merge & clean Kaggle datasets → train/val .txt + BOTH .gpt2.bin and .llama3.bin (parallel, ctx=1024)."
+        description="Kaggle merge/clean → train/val .txt + {gpt2,llama3}.bin (RAM-first + parallel; ctx-capped)."
     )
     # outputs
     p.add_argument('--train-out', type=str, default='dataset/data/training_data.txt')
@@ -69,12 +87,12 @@ def build_argparser():
     p.add_argument('--val-ratio', type=float, default=0.10, help='Validation fraction (after dedupe).')
     p.add_argument('--seed',      type=int, default=42)
 
-    # parallelism (safe defaults; tweak as you like)
+    # parallelism (safe defaults; on i9-14900K you can keep or raise)
     cpu = os.cpu_count() or 8
     p.add_argument('--workers', type=int, default=min(16, cpu),
                    help='Threads for dataset parsing / row processing.')
     p.add_argument('--token-workers', type=int, default=min(28, max(2, cpu - 4)),
-                   help='Processes for parallel tokenization (one tokenizer per process).')
+                   help='Processes for parallel tokenization.')
 
     # DSM
     p.add_argument('--include-dsm', action='store_true', help='Inject DSM-5 Q&A from --dsm-file.')
@@ -94,14 +112,18 @@ def build_argparser():
 
     # dedupe / volume
     p.add_argument('--dedupe-cap', type=int, default=2_000_000, help='Max distinct items tracked for dedupe.')
-    p.add_argument('--rmhd-seen-cap', type=int, default=600_000, help='Light dedupe cap for RMHD.')
+    p.add_argument('--rmhd-seen-cap', type=int, default=600_000, help='(Legacy) RMHD light dedupe (global dedupe still applies).')
     p.add_argument('--skip-rmhd', action='store_true', help='(Optional) Skip RMHD to move faster.')
     p.add_argument('--max-per-dataset', type=int, default=0, help='Optional cap per dataset (0 = no cap).')
 
-    # context packing (default = 1024)
-    p.add_argument('--ctx', type=int, default=1024, help='Pack tokens into blocks of this size.')
+    # Context length (default 1024 for GPT-2) and packing
+    p.add_argument('--ctx', type=int, default=1024, help='Hard cap per sequence and pack block size.')
     p.add_argument('--drop-last', action='store_true',
                    help='Drop final partial block (< ctx tokens) when writing .bin.')
+
+    # Llama tokenizer id (needs HF auth/weights access)
+    p.add_argument('--llama-tokenizer', type=str, default='meta-llama/Meta-Llama-3.1-8B',
+                   help='HF tokenizer id for Llama-3. If unavailable, falls back to Meta-Llama-3-8B.')
     return p
 
 
@@ -139,7 +161,6 @@ _EMOJI_RE    = re.compile(
 _CUSTOM_PROFANITY = set()
 _spacy_nlp = None
 args = None
-
 cache_dir = Path("data_cache")
 
 
@@ -247,27 +268,22 @@ def keywordize_text(text: str) -> str:
         toks = [t for t in x.split() if t not in _STOP and len(t) > 1]
 
     toks = strip_profanity_tokens(toks)
-    if args.unique-keywords if False else False:  # placeholder to avoid IDE guesses; actual unique below
-        pass
-    # per-post uniqueness
-    if args.unique_keywords == 'on':
-        toks = list(dict.fromkeys(toks))
+    if args.unique-keywords if False else args.unique_keywords:  # guard against editor replacements
+        toks = list(dict.fromkeys(toks))  # per-post uniqueness
     if len(toks) < args.min_kw:
         return ""
     return " ".join(toks)
 
-def prepare_post(raw_text: str, title: str = "") -> str | None:
+def prepare_post(raw_text: str, title: str = "") -> str:
     if not raw_text:
-        return None
+        return ""
     full = raw_text
     if title and title.strip() and title not in raw_text:
         full = f"{title.strip()}\n{raw_text}"
     if is_spammy_raw(full):
-        return None
+        return ""
     full = " ".join(full.split())
     kw = keywordize_text(full)
-    if not kw:
-        return None
     return kw
 
 def sample_line(post: str, task: str, answer: str) -> str:
@@ -276,6 +292,8 @@ def sample_line(post: str, task: str, answer: str) -> str:
 def _parallel_rows(rows, fn, limit=0, workers=8):
     """Apply fn(row)->list[str] in parallel and flatten; respect optional cap."""
     out = []
+    if not rows:
+        return out
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(fn, r) for r in rows]
         for fut in as_completed(futs):
@@ -287,7 +305,7 @@ def _parallel_rows(rows, fn, limit=0, workers=8):
 
 
 # ---------------------------
-# Dataset builders (parallel)
+# Dataset builders (return list[str]) — each row processed in parallel
 # ---------------------------
 def ds_kamaruladha(maxn=0):
     slug = "kamaruladha/mental-disorders-identification-reddit-nlp"
@@ -306,8 +324,8 @@ def ds_kamaruladha(maxn=0):
         if not label: return []
         low = label.lower()
         mapping = {"adhd":"ADHD","ptsd":"PTSD","ocd":"OCD"}
-        label = mapping.get(low, label.capitalize() if low==label else label)
-        return [sample_line(post, "Identify which mental health condition this post is about.", label)]
+        label2 = mapping.get(low, label.capitalize() if low==label else label)
+        return [sample_line(post, "Identify which mental health condition this post is about.", label2)]
 
     return _parallel_rows(rows, proc, maxn, args.workers)
 
@@ -326,11 +344,11 @@ def ds_bipolar(maxn=0):
         sent = (row.get('sentiment') or row.get('sentiment_label') or "")
         if not str(sent).strip(): return []
         s = str(sent).lower()
-        if s == '1' or 'pos' in s: sent = "Positive"
-        elif s == '-1' or 'neg' in s: sent = "Negative"
-        elif s == '0' or 'neu' in s: sent = "Neutral"
-        else: sent = str(sent).capitalize()
-        out = [sample_line(post, "Determine the sentiment expressed in the following bipolar discussion post.", sent)]
+        if s == '1' or 'pos' in s: sent2 = "Positive"
+        elif s == '-1' or 'neg' in s: sent2 = "Negative"
+        elif s == '0' or 'neu' in s: sent2 = "Neutral"
+        else: sent2 = str(sent).capitalize()
+        out = [sample_line(post, "Determine the sentiment expressed in the following bipolar discussion post.", sent2)]
         risk = (row.get('risk_factor') or "").strip()
         if risk:
             out.append(sample_line(post, "Identify any risk factor mentioned in the post.", risk))
@@ -480,7 +498,7 @@ def ds_social_anxiety(maxn=0):
     return _parallel_rows(rows, proc, maxn, args.workers)
 
 # ---- RMHD: parallel per file (threads) ----
-def _rmhd_process_file(path: Path, rmhd_seen_texts: set, seen_cap: int) -> list[str]:
+def _rmhd_process_file(path: Path) -> list:
     def canon_disorder(name: str) -> str:
         if not name: return ""
         low = name.strip().lower()
@@ -534,11 +552,6 @@ def _rmhd_process_file(path: Path, rmhd_seen_texts: set, seen_cap: int) -> list[
             if not raw: continue
             post = prepare_post(raw, title)
             if not post: continue
-            if len(rmhd_seen_texts) < seen_cap:
-                if post in rmhd_seen_texts:
-                    pass
-                else:
-                    rmhd_seen_texts.add(post)
             disorder = None
             for k in ("subreddit","condition","category","label","mental_illness","diagnosis","target","class"):
                 v = row.get(k)
@@ -558,10 +571,9 @@ def ds_rmhd_parallel(maxn=0):
     if not cands:
         return []
     print(f"[+] RMHD: {len(cands)} files (parallel parse with {args.workers} threads)")
-    rmhd_seen_texts = set()
     out = []
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = [ex.submit(_rmhd_process_file, p, rmhd_seen_texts, args.rmhd_seen_cap) for p in cands]
+        futures = [ex.submit(_rmhd_process_file, p) for p in cands]
         for fut in as_completed(futures):
             chunk = fut.result() or []
             out.extend(chunk)
@@ -571,7 +583,7 @@ def ds_rmhd_parallel(maxn=0):
 
 
 # ---------------------------
-# DSM-5 injection (keeps tag literal)
+# DSM-5 injection
 # ---------------------------
 def inject_dsm_lines():
     if not args.include_dsm:
@@ -588,9 +600,8 @@ def inject_dsm_lines():
         if disorder and bucket:
             crit = " ".join([x.strip() for x in bucket if x.strip()])
             if crit:
-                out.append(sample_line("(DSM-5 Reference)",
-                                       f"List the DSM-5 diagnostic criteria for {disorder}.",
-                                       crit))
+                post_kw = keywordize_text("(DSM-5 Reference)")
+                out.append(sample_line(post_kw, f"List the DSM-5 diagnostic criteria for {disorder}.", crit))
     for line in lines:
         if line.isupper() and line.strip() and len(line.split()) < 10:
             flush()
@@ -604,130 +615,133 @@ def inject_dsm_lines():
 
 
 # ---------------------------
-# Tokenization (parallel, ctx=1024, two models)
+# Tokenization (parallel, hard cap to ctx, packed to fixed ctx blocks)
+#   TWO outputs by default:
+#     - GPT-2 (tiktoken)  -> *_gpt2.bin  (uint16)
+#     - Llama-3 (HF tok)  -> *_llama3.bin (uint32; llama vocab > 65535)
 # ---------------------------
-# ---- GPT-2 (tiktoken) ----
-_GPT2_ENC = None
-_GPT2_EOT = None
+def _split_even(lst, parts):
+    n = len(lst)
+    if parts <= 1 or n == 0:
+        return [lst]
+    step = (n + parts - 1) // parts
+    return [lst[i:i+step] for i in range(0, n, step)]
 
-def _gpt2_init():
-    global _GPT2_ENC, _GPT2_EOT
+# ---- GPT-2 / tiktoken (process worker) ----
+def _tok_mp_gpt2_init():
+    global _ENC_GPT2
     if tiktoken is None:
         raise RuntimeError("tiktoken not installed. pip install tiktoken")
-    _GPT2_ENC = tiktoken.get_encoding("gpt2")
-    _GPT2_EOT = _GPT2_ENC._special_tokens['<|endoftext|>']
+    _ENC_GPT2 = tiktoken.get_encoding("gpt2")
 
-def _gpt2_encode_chunk(lines_ctx):
-    lines, ctx = lines_ctx
-    enc = _GPT2_ENC
-    eot = _GPT2_EOT
+def _tok_mp_gpt2_encode(lines_ctx):
+    lines, ctx_len = lines_ctx
+    enc = _ENC_GPT2
     out = []
     for s in lines:
-        # remove any literal "<|endoftext|>" strings; we add the special EOT id ourselves
-        s = s.replace("<|endoftext|>", "")
-        ids = enc.encode_ordinary(s)
-        # ensure EOT fits under ctx cap (reserve 1 slot)
-        if len(ids) >= ctx:
-            ids = ids[:ctx-1]
-        ids.append(eot)
-        if len(ids) > ctx:
-            ids = ids[:ctx]
+        ids = enc.encode_ordinary(s)  # no special tokens inserted
+        if len(ids) > ctx_len:
+            ids = ids[:ctx_len]
         out.append(ids)
     return out
 
-# ---- Llama-3 (HF AutoTokenizer) ----
-_LLAMA_TK = None
-_LLAMA_EOS = None
-
-def _llama_init():
-    global _LLAMA_TK, _LLAMA_EOS
+# ---- Llama-3 / HF AutoTokenizer (process worker) ----
+def _tok_mp_llama3_init(tokenizer_id: str):
+    global _ENC_LLAMA
     if AutoTokenizer is None:
         raise RuntimeError("transformers not installed. pip install transformers")
-    # public name consistent with your reference
-    _LLAMA_TK = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
-    _LLAMA_EOS = _LLAMA_TK.eos_token_id
+    try:
+        _ENC_LLAMA = AutoTokenizer.from_pretrained(tokenizer_id)
+    except Exception:
+        # fallback that commonly exists
+        _ENC_LLAMA = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
 
-def _llama_encode_chunk(lines_ctx):
-    lines, ctx = lines_ctx
-    # remove literal gpt2 eot marker (llama doesn't have this special token)
-    texts = [s.replace("<|endoftext|>", "") for s in lines]
-    enc = _LLAMA_TK(texts, add_special_tokens=False, truncation=True, max_length=ctx-1)
+def _tok_mp_llama3_encode(lines_ctx):
+    lines, ctx_len = lines_ctx
+    tok = _ENC_LLAMA
+    enc = tok(lines, add_special_tokens=False, truncation=True, max_length=ctx_len)
     out = []
     for ids in enc["input_ids"]:
-        if len(ids) >= ctx:
-            ids = ids[:ctx-1]
-        ids = list(ids) + [_LLAMA_EOS]
-        if len(ids) > ctx:
-            ids = ids[:ctx]
+        if len(ids) > ctx_len:
+            ids = ids[:ctx_len]
         out.append(ids)
     return out
 
-def _split_for_workers(seq, n_parts):
-    n = len(seq)
-    if n == 0: return []
-    step = (n + n_parts - 1) // n_parts
-    return [seq[i:i+step] for i in range(0, n, step)]
-
-def _write_packed(bin_path: Path, seqs, ctx: int, drop_last: bool, dtype):
-    # pack into fixed ctx blocks (streaming, single pass)
-    buf = np.zeros(ctx, dtype=dtype)
+def _pack_and_write(all_token_seqs, out_bin_path: Path, ctx_len: int, drop_last: bool, dtype):
+    # Pack token sequences into fixed ctx_len blocks
+    buf = np.empty(ctx_len, dtype=dtype)
     buf_len = 0
     total_chunks = 0
     max_seen = 0
-    with open(bin_path, 'wb') as fout:
-        for ids in seqs:
-            max_seen = max(max_seen, len(ids))
+
+    with open(out_bin_path, 'wb') as fout:
+        for seq in all_token_seqs:
+            if len(seq) > ctx_len:
+                seq = seq[:ctx_len]  # defensive (shouldn’t trigger)
+            max_seen = max(max_seen, len(seq))
             i = 0
-            while i < len(ids):
-                take = min(ctx - buf_len, len(ids) - i)
+            while i < len(seq):
+                take = min(ctx_len - buf_len, len(seq) - i)
                 if take:
-                    buf[buf_len:buf_len+take] = np.asarray(ids[i:i+take], dtype=dtype)
+                    buf[buf_len:buf_len+take] = np.asarray(seq[i:i+take], dtype=dtype)
                     buf_len += take
                     i += take
-                if buf_len == ctx:
+                if buf_len == ctx_len:
                     buf.tofile(fout)
                     total_chunks += 1
                     buf_len = 0
         if buf_len and not drop_last:
             buf[:buf_len].tofile(fout)
             total_chunks += 1
+
     return total_chunks, max_seen
 
-def tokenize_both_models(train_lines, val_lines, ctx_len: int, token_workers: int, drop_last: bool,
-                         train_path: Path, val_path: Path):
-    # ---- GPT-2 (uint16) ----
-    print(f"[tok:gpt2] ctx={ctx_len} workers={token_workers}")
-    gpt2_train, gpt2_val = [], []
-    with ProcessPoolExecutor(max_workers=token_workers, initializer=_gpt2_init) as ex:
-        for name, lines, acc in (("train", train_lines, gpt2_train), ("val", val_lines, gpt2_val)):
-            chunks = _split_for_workers(lines, token_workers)
-            futs = [ex.submit(_gpt2_encode_chunk, (c, ctx_len)) for c in chunks]
+def tokenize_lines_to_bins(lines, out_prefix: Path, ctx_len: int, workers: int, drop_last: bool, llama_tok_id: str):
+    """
+    Produce two bin files:
+      - <out_prefix>_gpt2.bin    (tiktoken, uint16)
+      - <out_prefix>_llama3.bin  (HF AutoTokenizer, uint32)
+    Parallelized with a process pool; sequences strictly capped to ctx_len.
+    """
+    n = len(lines)
+    if n == 0:
+        for suffix in ("_gpt2.bin", "_llama3.bin"):
+            open(out_prefix.with_suffix(suffix), 'wb').close()
+        print(f"[tokenize] {out_prefix}* | nothing to write")
+        return
+
+    splits = _split_even(lines, max(1, workers))
+
+    # --- GPT-2 / tiktoken ---
+    out_gpt2 = out_prefix.with_suffix("_gpt2.bin")
+    if tiktoken is None:
+        print("[tokenize:gpt2] SKIP (tiktoken not installed)")
+    else:
+        print(f"[tokenize:gpt2] {out_gpt2} | ctx={ctx_len} | workers={len(splits)}")
+        all_gpt2 = []
+        with ProcessPoolExecutor(max_workers=len(splits), initializer=_tok_mp_gpt2_init) as ex:
+            futs = [ex.submit(_tok_mp_gpt2_encode, (chunk, ctx_len)) for chunk in splits]
             for fut in as_completed(futs):
-                acc.extend(fut.result())
+                all_gpt2.extend(fut.result())
+        chunks, max_seen = _pack_and_write(all_gpt2, out_gpt2, ctx_len, drop_last, dtype=np.uint16)
+        print(f"[tokenize:gpt2] wrote {chunks} chunk(s); max per-seq length observed = {max_seen} (≤ {ctx_len})")
 
-    gpt2_train_bin = train_path.with_suffix(".gpt2.bin")
-    gpt2_val_bin   = val_path.with_suffix(".gpt2.bin")
-    n_chunks, mx = _write_packed(gpt2_train_bin, gpt2_train, ctx_len, drop_last, np.uint16)
-    print(f"[tok:gpt2] wrote {gpt2_train_bin} | chunks={n_chunks} | max_seq_len={mx} (≤ {ctx_len})")
-    n_chunks, mx = _write_packed(gpt2_val_bin, gpt2_val, ctx_len, drop_last, np.uint16)
-    print(f"[tok:gpt2] wrote {gpt2_val_bin} | chunks={n_chunks} | max_seq_len={mx} (≤ {ctx_len})")
-
-    # ---- Llama-3 (uint32) ----
-    print(f"[tok:llama3] ctx={ctx_len} workers={token_workers}")
-    llama_train, llama_val = [], []
-    with ProcessPoolExecutor(max_workers=token_workers, initializer=_llama_init) as ex:
-        for name, lines, acc in (("train", train_lines, llama_train), ("val", val_lines, llama_val)):
-            chunks = _split_for_workers(lines, token_workers)
-            futs = [ex.submit(_llama_encode_chunk, (c, ctx_len)) for c in chunks]
+    # --- Llama-3 / HF ---
+    out_llama = out_prefix.with_suffix("_llama3.bin")
+    if AutoTokenizer is None:
+        print("[tokenize:llama3] SKIP (transformers not installed)")
+    else:
+        print(f"[tokenize:llama3] {out_llama} | ctx={ctx_len} | workers={len(splits)}")
+        all_llama = []
+        # pass tokenizer id via lambda to initializer (workaround for ProcessPoolExecutor)
+        def _init_llama():
+            _tok_mp_llama3_init(llama_tok_id)
+        with ProcessPoolExecutor(max_workers=len(splits), initializer=_init_llama) as ex:
+            futs = [ex.submit(_tok_mp_llama3_encode, (chunk, ctx_len)) for chunk in splits]
             for fut in as_completed(futs):
-                acc.extend(fut.result())
-
-    llama_train_bin = train_path.with_suffix(".llama3.bin")
-    llama_val_bin   = val_path.with_suffix(".llama3.bin")
-    n_chunks, mx = _write_packed(llama_train_bin, llama_train, ctx_len, drop_last, np.uint32)
-    print(f"[tok:llama3] wrote {llama_train_bin} | chunks={n_chunks} | max_seq_len={mx} (≤ {ctx_len})")
-    n_chunks, mx = _write_packed(llama_val_bin, llama_val, ctx_len, drop_last, np.uint32)
-    print(f"[tok:llama3] wrote {llama_val_bin} | chunks={n_chunks} | max_seq_len={mx} (≤ {ctx_len})")
+                all_llama.extend(fut.result())
+        chunks, max_seen = _pack_and_write(all_llama, out_llama, ctx_len, drop_last, dtype=np.uint32)
+        print(f"[tokenize:llama3] wrote {chunks} chunk(s); max per-seq length observed = {max_seen} (≤ {ctx_len})")
 
 
 # ---------------------------
@@ -768,8 +782,132 @@ def main():
     else:
         print("[*] Skipping RMHD as requested.")
 
-    # optional sets you had before (CID007, Panic, ADHD) can be added here similarly
-    # (omitted to keep this script focused on tokenizer rebuild)
+    # Optional additional sets (CID007, Panic, ADHD)
+    def ds_cid007(maxn=0):
+        slug = "cid007/mental-disorder-classification"
+        d = cache_dir / "mental_disorder_classification"
+        kaggle_download(slug, d)
+        pth = None
+        for ext in ("*.csv","*.tsv","*.xlsx"):
+            L = list(d.rglob(ext))
+            if L: pth = L[0]; break
+        if not pth: return []
+        rows = read_csv_any(pth) if pth.suffix.lower() in (".csv",".tsv") else (pd.read_excel(pth).to_dict(orient="records") if pd else [])
+        if not rows: return []
+        keys0 = list(rows[0].keys())
+        def norm(s): return s.lower().strip().replace(" ","_")
+        label_col = None
+        pref = ("diagnos","disorder","label","class","target","illness","condition","result")
+        for k in keys0:
+            if any(w in norm(k) for w in pref):
+                label_col = k; break
+        if not label_col and pd is not None:
+            dfh = pd.DataFrame(rows)
+            for k in keys0:
+                try:
+                    u = dfh[k].nunique(dropna=True)
+                    if 2 <= u <= 8 and not pd.api.types.is_numeric_dtype(dfh[k]): label_col = k; break
+                except Exception:
+                    pass
+        if not label_col: return []
+        symptom_cols = [k for k in keys0 if k != label_col]
+        def clean_diag(x):
+            if x is None: return ""
+            low = str(x).strip().lower()
+            mp = {"normal":"Normal","anxiety":"Anxiety","depression":"Depression","bipolar":"Bipolar","ptsd":"PTSD","ocd":"OCD","adhd":"ADHD"}
+            return mp.get(low, str(x).strip().title())
+        def include_val(v):
+            if v is None: return False
+            s = str(v).strip().lower()
+            if s in ("","nan","none"): return False
+            try:
+                return float(s) > 0.0
+            except Exception:
+                return s in ("yes","true","present","high","mild","moderate","severe","1")
+        def proc(r):
+            diag = clean_diag(r.get(label_col,""))
+            if not diag: return []
+            pres = []
+            for c in symptom_cols:
+                if include_val(r.get(c,"")):
+                    pres.append(str(c).replace("_"," ").strip().title())
+            if not pres and diag != "Normal": 
+                return []
+            if not pres and diag == "Normal":
+                pres = ["No significant psychiatric symptoms"]
+            post = prepare_post(f"Patient exhibits the following symptoms: {', '.join(pres[:6])}.")
+            if not post: return []
+            return [sample_line(post, "Determine the most likely diagnosis for this patient.", diag)]
+        return _parallel_rows(rows, proc, maxn, args.workers)
+
+    def ds_panic(maxn=0):
+        slug = "muhammadshahidazeem/panic-disorder-detection-dataset"
+        d = cache_dir / "panic_disorder_detection"
+        kaggle_download(slug, d)
+        files = [p for p in d.glob("*") if p.suffix.lower() in (".csv",".tsv")]
+        if not files: return []
+        rows = []
+        for f in files:
+            rows.extend(read_csv_any(f))
+        def proc(r):
+            k0 = list(r.keys())
+            label_key = next((k for k in k0 if ("panic" in k.lower()) and any(x in k.lower() for x in ("label","disorder","target"))), None) or k0[-1]
+            lv = str(r.get(label_key,"")).strip().lower()
+            ans = "Yes" if lv in ("1","yes","true","panic") else "No"
+            parts=[]
+            for fk in k0:
+                if fk == label_key: continue
+                v = str(r.get(fk,"")).strip()
+                if not v or v.lower()=="nan": continue
+                low = fk.lower()
+                if low in ("age","gender","sex"):
+                    parts.append(f"{fk}: {v}")
+                elif low in ("symptom","symptoms","chest_pain","sweating","palpitations","dizziness"):
+                    if v in ("1","yes","true"): parts.append(f"{fk.replace('_',' ')}: yes")
+                if len(parts)>=5: break
+            if not parts: parts.append("no notable symptoms")
+            post = prepare_post(f"Patient data - {'; '.join(parts)}.")
+            if not post: return []
+            return [sample_line(post, "Is this a case of Panic Disorder? Answer Yes or No.", ans)]
+        return _parallel_rows(rows, proc, maxn, args.workers)
+
+    def ds_adhd(maxn=0):
+        slug = "jerseyneo/reddit-adhd-dataset"
+        d = cache_dir / "reddit_adhd_dataset"
+        kaggle_download(slug, d)
+        csvs = sorted(d.glob("*.csv"))
+        if not csvs: return []
+        rows = []
+        for pth in csvs:
+            with pth.open('r', encoding='utf-8', errors='ignore') as f:
+                sample = f.read(8192); f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample)
+                except Exception:
+                    dialect = csv.excel
+                rows.extend(list(csv.DictReader(f, dialect=dialect)))
+        candidate_fields = ("selftext","body","comment","text","content","message","post","description")
+        def proc(row):
+            raw = None
+            for k in candidate_fields:
+                v = row.get(k)
+                if v and str(v).strip():
+                    raw = str(v); break
+            if not raw:
+                joined = " ".join(str(row.get(k,"")).strip()
+                                  for k in ("title","selftext","body")
+                                  if str(row.get(k,"")).strip()).strip()
+                raw = joined if joined else None
+            if not raw: return []
+            title = (row.get("title") or "")
+            post = prepare_post(raw, title)
+            if not post: return []
+            return [sample_line(post, "Identify which mental health condition this post is about.", "ADHD")]
+        return _parallel_rows(rows, proc, maxn, args.workers)
+
+    take(ds_cid007,      "CID007 (symptom→diagnosis)")
+    take(ds_panic,       "Panic disorder detection")
+    take(ds_adhd,        "Reddit ADHD (jerseyneo)")
 
     # DSM-5
     dsm = inject_dsm_lines()
@@ -806,12 +944,13 @@ def main():
     val_path.write_text("\n".join(val_lines) + "\n", encoding="utf-8")
     print(f"[write] {train_path} , {val_path}")
 
-    # --- Tokenize BOTH models, in parallel per model/process, strict ctx=1024 ---
-    tokenize_both_models(train_lines, val_lines, args.ctx, args.token_workers, args.drop_last,
-                         train_path, val_path)
+    # --- Tokenize in parallel, **strictly capped to ctx**, packed into fixed ctx chunks ---
+    tokenize_lines_to_bins(train_lines, train_path, args.ctx, args.token_workers, args.drop_last, args.llama_tokenizer)
+    tokenize_lines_to_bins(val_lines,   val_path,   args.ctx, max(2, args.token_workers//2), args.drop_last, args.llama_tokenizer)
 
     print("[done] all steps complete.")
 
 
 if __name__ == "__main__":
     main()
+```0
