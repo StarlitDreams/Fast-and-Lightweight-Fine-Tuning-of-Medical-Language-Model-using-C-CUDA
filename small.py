@@ -1,276 +1,243 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ADHD-only trial for llm.c
-- Download jerseyneo/reddit-adhd-dataset (Kaggle)
-- Build "Post/Task/Answer" examples (RAM)
-- Shuffle + split
-- Tokenize for GPT-2 exactly like llm.c docs (EOT + encode_ordinary + '\n\n' quirk)
-- Write *.gpt2.bin using data_common.write_datafile (adds the required header)
+Process ONLY jerseyneo/reddit-adhd-dataset and tokenize to llm.c GPT-2 .bin shards.
 
-Outputs:
-  dataset/data/training_data.gpt2.bin
-  dataset/data/validation_data.gpt2.bin
+Pipeline
+  1) Kaggle download (once) -> data_cache/reddit_adhd_dataset
+  2) Parse all CSVs (threaded per-row), extract (title + text)
+  3) Light clean: strip URLs/emails/mentions/hashtags, collapse whitespace
+     (no lemmatization, no stopword removal, keep natural text)
+  4) On-the-fly split to train/val and SHA1 dedupe
+  5) Tokenize with tiktoken(gpt2) EXACTLY like the docs: prepend EOT (id=50256)
+     to every example, then encode_ordinary(text)
+  6) Write sharded .bin with llm.c header via dev/data/data_common.write_datafile
+  7) (Optional) write .txt mirrors for inspection
+
+Run:
+  python3 adhd_only_tokenize.py \
+    --out-dir dataset/data \
+    --val-ratio 0.10 \
+    --shard-tokens 1500000 \
+    --workers 16
 """
 
-import os, sys, re, csv, math, argparse, hashlib, random
+import os, sys, csv, re, argparse, hashlib, random
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import tiktoken
 
-# --------------------------------------------------------------------------------------
-# Robust import of write_datafile from llm.c repo
-# --------------------------------------------------------------------------------------
-HERE = Path(__file__).resolve().parent
-CANDIDATES = [
-    HERE,                     # repo root
-    HERE / "data",            # llm.c/data/data_common.py (usual location)
-]
-for cand in CANDIDATES:
-    if (cand / "data_common.py").exists():
-        sys.path.insert(0, str(cand))
-        break
-
+# ---------- llm.c helper (dev/data/data_common.py) ----------
+DEV_DATA_DIR = Path(__file__).resolve().parent / "dev" / "data"
+if (DEV_DATA_DIR / "data_common.py").exists() and str(DEV_DATA_DIR) not in sys.path:
+    sys.path.insert(0, str(DEV_DATA_DIR))
 try:
-    from data_common import write_datafile  # provided by llm.c repo
+    from data_common import write_datafile  # provided by llm.c
 except Exception as e:
-    raise SystemExit(
-        "Could not import write_datafile from data_common.py.\n"
-        "Put this script in the llm.c repo root and make sure data/data_common.py exists.\n"
-        f"Details: {e}"
-    )
+    print("Could not import write_datafile from dev/data/data_common.py.\n"
+          "Place this script in the llm.c repo root so dev/data/data_common.py is importable.\n"
+          f"Details: {e}")
+    sys.exit(1)
 
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# ---------- external tokenization ----------
+try:
+    import tiktoken
+except Exception as e:
+    print("Missing dependency: tiktoken (pip install tiktoken)\n", e)
+    sys.exit(1)
 
-# --------------------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------------------
-def build_argparser():
-    p = argparse.ArgumentParser(
-        description="ADHD-only trial → GPT-2 tokenized .bin for llm.c (with header)."
-    )
-    p.add_argument("--train-out", type=str, default="dataset/data/training_data.gpt2.bin")
-    p.add_argument("--val-out",   type=str, default="dataset/data/validation_data.gpt2.bin")
-    p.add_argument("--val-ratio", type=float, default=0.10)
-    p.add_argument("--seed",      type=int, default=42)
+# ---------- config ----------
+cache_dir = Path("data_cache")
+ds_dir = cache_dir / "reddit_adhd_dataset"
+slug = "jerseyneo/reddit-adhd-dataset"
 
-    cpu = os.cpu_count() or 8
-    p.add_argument("--workers",     type=int, default=min(16, cpu), help="Threads for CSV parsing / row processing.")
-    p.add_argument("--tok-workers", type=int, default=min(24, max(2, cpu - 4)), help="Threads for tokenization.")
-    p.add_argument("--max-examples", type=int, default=200_000,
-                   help="Cap examples to stay within RAM. Set 0 for all.")
-    return p
-
-# --------------------------------------------------------------------------------------
-# Light cleaning (keep semantics)
-# --------------------------------------------------------------------------------------
+# text cleaning (very light)
 _URL_RE      = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
 _EMAIL_RE    = re.compile(r'\b[\w\.-]+@[\w\.-]+\.\w+\b')
 _MENTION_RE  = re.compile(r'@\w+')
 _HASHTAG_RE  = re.compile(r'#\w+')
 _MULTI_WS_RE = re.compile(r'\s+')
-_EMOJI_RE    = re.compile(
-    "["  # emoji / pictographs
-    "\U0001F600-\U0001F64F"
-    "\U0001F300-\U0001F5FF"
-    "\U0001F680-\U0001F6FF"
-    "\U0001F1E0-\U0001F1FF"
-    "\U00002700-\U000027BF"
-    "\U000024C2-\U0001F251"
-    "]+", flags=re.UNICODE
-)
 
-def clean_text(x: str) -> str:
-    if not x:
-        return ""
-    x = _URL_RE.sub(" ", x)
-    x = _EMAIL_RE.sub(" ", x)
-    x = _MENTION_RE.sub(" ", x)
-    x = _HASHTAG_RE.sub(" ", x)
-    x = _EMOJI_RE.sub(" ", x)
-    x = _MULTI_WS_RE.sub(" ", x).strip()
-    return x
+CAND_TEXT_FIELDS = ("selftext","body","comment","text","content","message","post","description")
 
-# --------------------------------------------------------------------------------------
-# Kaggle helper
-# --------------------------------------------------------------------------------------
-def kaggle_download(slug: str, dest: Path):
-    if dest.exists() and any(dest.iterdir()):
-        print(f"[+] {slug} already in {dest}")
+# ---------- helpers ----------
+def kaggle_download():
+    if ds_dir.exists() and any(ds_dir.iterdir()):
+        print(f"[+] {slug} already in {ds_dir}")
         return
-    dest.mkdir(parents=True, exist_ok=True)
+    ds_dir.mkdir(parents=True, exist_ok=True)
     print(f"[-] Downloading {slug} ...")
-    code = os.system(f'kaggle datasets download -d "{slug}" -p "{dest}" --quiet --unzip')
+    code = os.system(f'kaggle datasets download -d "{slug}" -p "{ds_dir}" --quiet --unzip')
     if code != 0:
-        raise RuntimeError(f"Failed to download {slug}. Check Kaggle CLI & credentials.")
+        raise RuntimeError("Kaggle download failed. Ensure kaggle CLI and credentials are set.")
 
-# --------------------------------------------------------------------------------------
-# CSV reader
-# --------------------------------------------------------------------------------------
-def read_csv_any(path: Path):
-    try:
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
-            sample = f.read(4096); f.seek(0)
-            try:
-                dialect = csv.Sniffer().sniff(sample)
-            except Exception:
-                dialect = csv.excel
-            return list(csv.DictReader(f, dialect=dialect))
-    except Exception:
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
-            return list(csv.DictReader(f))
+def sniff_reader(path: Path):
+    with path.open('r', encoding='utf-8', errors='ignore') as f:
+        sample = f.read(8192); f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except Exception:
+            dialect = csv.excel
+        for row in csv.DictReader(f, dialect=dialect):
+            yield row
 
-# --------------------------------------------------------------------------------------
-# Build ADHD supervision examples
-# --------------------------------------------------------------------------------------
-def build_adhd_examples(workers: int, max_examples: int) -> list[str]:
-    slug = "jerseyneo/reddit-adhd-dataset"
-    root = Path("data_cache/reddit_adhd_dataset")
-    kaggle_download(slug, root)
-    csvs = sorted(root.glob("*.csv"))
+def clean_join_title_body(row) -> str | None:
+    """Return a single natural text string (title + body) or None."""
+    title = (row.get("title") or "").strip()
+    raw = None
+    for k in CAND_TEXT_FIELDS:
+        v = row.get(k)
+        if v and str(v).strip():
+            raw = str(v); break
+    if not raw:
+        joined = " ".join(str(row.get(k,"")).strip()
+                          for k in ("title","selftext","body")
+                          if str(row.get(k,"")).strip()).strip()
+        raw = joined if joined else None
+    if not raw:
+        return None
+    text = (f"{title}\n{raw}" if title and title not in raw else raw)
+    # light normalization only
+    text = _URL_RE.sub(" ", text)
+    text = _EMAIL_RE.sub(" ", text)
+    text = _MENTION_RE.sub(" ", text)
+    text = _HASHTAG_RE.sub(" ", text)
+    text = _MULTI_WS_RE.sub(" ", text).strip()
+    return text if text else None
+
+def sha1(s: str) -> str:
+    return hashlib.sha1(s.encode('utf-8')).hexdigest()
+
+# ---------- token writer (sharded) ----------
+class ShardedWriter:
+    """Accumulates tokens and writes to .bin shards with llm.c header."""
+    def __init__(self, out_prefix: Path, model_desc: str, shard_tokens: int):
+        self.out_prefix = out_prefix
+        self.model_desc = model_desc
+        self.shard_tokens = shard_tokens
+        self.buf = []
+        self.total = 0
+        self.idx = 1
+        self.written_files = []
+
+    def add(self, token_ids):
+        self.buf.extend(token_ids)
+        if len(self.buf) >= self.shard_tokens:
+            self.flush()
+
+    def flush(self):
+        if not self.buf: return
+        out_path = Path(f"{self.out_prefix}.gpt2-{self.idx:05d}.bin")
+        write_datafile(str(out_path), self.buf, self.model_desc)
+        self.written_files.append(out_path)
+        self.total += len(self.buf)
+        print(f"[write] {out_path.name}  | tokens={len(self.buf):,}  | total={self.total:,}")
+        self.idx += 1
+        self.buf = []
+
+# ---------- main ----------
+def main():
+    ap = argparse.ArgumentParser("ADHD-only: process + tokenize for llm.c (GPT-2).")
+    ap.add_argument("--out-dir", type=str, default="dataset/data", help="Output directory for .bin and optional .txt")
+    ap.add_argument("--val-ratio", type=float, default=0.10, help="Fraction to route to validation")
+    ap.add_argument("--seed", type=int, default=42, help="Random seed for split")
+    ap.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 8), help="Threads for row processing")
+    ap.add_argument("--dedupe-cap", type=int, default=2_000_000, help="Max texts to track for dedupe")
+    ap.add_argument("--max-examples", type=int, default=0, help="Optional cap for quick trials (0=no cap)")
+    ap.add_argument("--write-txt", action="store_true", help="Also write .txt mirrors for inspection")
+    ap.add_argument("--shard-tokens", type=int, default=1_500_000, help="Max tokens per .bin shard")
+    args = ap.parse_args()
+
+    random.seed(args.seed)
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+
+    kaggle_download()
+    csvs = sorted(ds_dir.glob("*.csv"))
     if not csvs:
-        raise RuntimeError("No CSVs found in ADHD dataset.")
+        print("[!] No CSVs found in dataset; abort.")
+        sys.exit(1)
 
-    print(f"[build] ADHD (jerseyneo) | files={len(csvs)} | workers={workers}")
-    rows = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(read_csv_any, p): p for p in csvs}
-        for fut in as_completed(futs):
-            part = fut.result() or []
-            rows.extend(part)
+    # tokenization setup (docs-correct)
+    enc = tiktoken.get_encoding("gpt2")
+    EOT = enc._special_tokens['<|endoftext|>']  # 50256
 
-    print(f"[build] raw rows: {len(rows):,}")
+    # sharded writers
+    train_prefix = Path(args.out_dir) / "training_data"
+    val_prefix   = Path(args.out_dir) / "validation_data"
+    train_writer = ShardedWriter(train_prefix, "gpt-2", args.shard_tokens)
+    val_writer   = ShardedWriter(val_prefix,   "gpt-2", args.shard_tokens)
 
-    cand_fields = ("selftext","body","comment","text","content","message","post","description")
+    # optional .txt mirrors
+    if args.write_txt:
+        ftrain = (Path(args.out_dir) / "adhd_training_data.txt").open("w", encoding="utf-8")
+        fval   = (Path(args.out_dir) / "adhd_validation_data.txt").open("w", encoding="utf-8")
+    else:
+        ftrain = fval = None
 
-    def proc(row):
-        raw = None
-        for k in cand_fields:
-            v = row.get(k)
-            if v and str(v).strip():
-                raw = str(v); break
-        if not raw:
-            joined = " ".join(str(row.get(k,"")).strip()
-                              for k in ("title","selftext","body")
-                              if str(row.get(k,"")).strip()).strip()
-            raw = joined if joined else None
-        if not raw:
-            return None
-        title = (row.get("title") or "")
-        text = clean_text(f"{title}\n{raw}" if title and title not in raw else raw)
+    # dedupe
+    seen = set()
+    keep = 0
+    total = 0
+    target_total = args.max_examples if args.max_examples > 0 else None
+
+    def proc_row(row):
+        text = clean_join_title_body(row)
         if not text:
             return None
-        post = text
-        task = "Identify which mental health condition this post is about."
-        answer = "ADHD"
-        return f"Post: {post}\nTask: {task}\nAnswer: {answer}"
+        h = sha1(text)
+        return (h, text)
 
-    out = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(proc, r) for r in rows]
-        for fut in as_completed(futs):
-            s = fut.result()
-            if s:
-                out.append(s)
-            if max_examples and len(out) >= max_examples:
+    print(f"[build] ADHD (jerseyneo) | files={len(csvs)} | workers={args.workers}")
+    for csv_path in csvs:
+        print(f"    -> {csv_path.name}")
+        rows = list(sniff_reader(csv_path))
+        # process rows in threads
+        out_pairs = []
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = [ex.submit(proc_row, r) for r in rows]
+            for fut in as_completed(futs):
+                pair = fut.result()
+                if pair: out_pairs.append(pair)
+
+        # route examples
+        for h, text in out_pairs:
+            total += 1
+            if len(seen) < args.dedupe_cap:
+                if h in seen:
+                    continue
+                seen.add(h)
+
+            # build a simple SFT-style triple (keeps semantics, easy for supervision)
+            example = f"Post: {text}\nTask: Identify which mental health condition this post is about.\nAnswer: ADHD"
+            # tokenize: prepend true EOT (docs behavior), then encode_ordinary
+            toks = [EOT]
+            toks.extend(enc.encode_ordinary(example))
+
+            if random.random() < args.val_ratio:
+                if fval:   fval.write(example + "\n")
+                val_writer.add(toks)
+            else:
+                if ftrain: ftrain.write(example + "\n")
+                train_writer.add(toks)
+
+            keep += 1
+            if target_total and keep >= target_total:
                 break
+        if target_total and keep >= target_total:
+            break
 
-    print(f"[build] ADHD examples: {len(out):,}")
-    return out
+    # final flush
+    train_writer.flush()
+    val_writer.flush()
+    if ftrain: ftrain.close()
+    if fval:   fval.close()
 
-# --------------------------------------------------------------------------------------
-# GPT-2 tokenization (exactly like docs) and write with header
-# --------------------------------------------------------------------------------------
-def tokenize_gpt2_docs_style(sections: list[str], workers: int) -> list[int]:
-    """
-    Docs behavior:
-        enc = tiktoken.get_encoding("gpt2")
-        eot = enc._special_tokens['<|endoftext|>']
-        tokens = []
-        for i, s in enumerate(sections):
-            tokens.append(eot)
-            spad = s + "\\n\\n" if i != len(sections) - 1 else s
-            tokens.extend(enc.encode_ordinary(spad))
-    """
-    enc = tiktoken.get_encoding("gpt2")
-    eot_id = enc._special_tokens['<|endoftext|>']
-
-    n = len(sections)
-    if n == 0:
-        return []
-
-    parts = max(1, workers)
-    step = math.ceil(n / parts)
-    ranges = [(i, min(i+step, n)) for i in range(0, n, step)]
-
-    def encode_range(a, b):
-        local = []
-        for i in range(a, b):
-            s = sections[i]
-            local.append(eot_id)
-            spad = s + "\n\n" if i != (n - 1) else s
-            local.extend(enc.encode_ordinary(spad))
-        return local
-
-    out_parts = [None] * len(ranges)
-    with ThreadPoolExecutor(max_workers=parts) as ex:
-        futs = []
-        for idx, (a, b) in enumerate(ranges):
-            futs.append((idx, ex.submit(encode_range, a, b)))
-        for idx, fut in futs:
-            out_parts[idx] = fut.result()
-
-    tokens = []
-    for part in out_parts:
-        tokens.extend(part)
-    return tokens
-
-# --------------------------------------------------------------------------------------
-# MAIN
-# --------------------------------------------------------------------------------------
-def main():
-    ap = build_argparser()
-    args = ap.parse_args()
-    random.seed(args.seed)
-
-    out_train = Path(args.train_out); out_train.parent.mkdir(parents=True, exist_ok=True)
-    out_val   = Path(args.val_out);   out_val.parent.mkdir(parents=True, exist_ok=True)
-
-    sections = build_adhd_examples(args.workers, args.max_examples)
-    if not sections:
-        print("[fatal] no examples produced."); return
-
-    # dedupe by sha1
-    seen = set(); uniq = []
-    for s in sections:
-        h = hashlib.sha1(s.encode("utf-8")).hexdigest()
-        if h in seen: continue
-        seen.add(h); uniq.append(s)
-    sections = uniq
-    print(f"[dedupe] kept={len(sections):,}")
-
-    # shuffle + split
-    rng = random.Random(args.seed)
-    rng.shuffle(sections)
-    split = int(len(sections) * (1.0 - args.val_ratio))
-    train_secs = sections[:split]
-    val_secs   = sections[split:]
-    print(f"[split] train={len(train_secs):,}  val={len(val_secs):,}  (val-ratio={args.val_ratio})")
-
-    # tokenize (GPT-2 docs-accurate) and write with header
-    print("[tok] encoding train...")
-    train_tokens = tokenize_gpt2_docs_style(train_secs, args.tok_workers)
-    print(f"[tok] train tokens: {len(train_tokens):,}")
-    write_datafile(str(out_train), train_tokens, "gpt-2")
-    print(f"[write] {out_train}")
-
-    print("[tok] encoding val...")
-    val_tokens = tokenize_gpt2_docs_style(val_secs, max(2, args.tok_workers // 2))
-    print(f"[tok] val tokens: {len(val_tokens):,}")
-    write_datafile(str(out_val), val_tokens, "gpt-2")
-    print(f"[write] {out_val}")
-
-    print("[done] ADHD GPT-2 data ready for llm.c")
+    print(f"[stats] input_rows≈{total:,}  kept={keep:,}  "
+          f"train_shards={len(train_writer.written_files)}  val_shards={len(val_writer.written_files)}")
+    print(f"[done] Train bins prefix: {train_prefix}.gpt2-*.bin")
+    print(f"[done] Val   bins prefix: {val_prefix}.gpt2-*.bin")
+    print("Hint: train with:")
+    print(f'  ./train_gpt2cu -i "{train_prefix}.gpt2-*.bin" -j "{val_prefix}.gpt2-*.bin" -T 1024 ...')
+    
 
 if __name__ == "__main__":
     main()
