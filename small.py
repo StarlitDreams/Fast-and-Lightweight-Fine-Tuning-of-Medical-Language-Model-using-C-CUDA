@@ -3,35 +3,51 @@
 """
 ADHD-only trial for llm.c
 - Download jerseyneo/reddit-adhd-dataset (Kaggle)
-- Build "Post/Task/Answer" lines (RAM)
-- Shuffle + split (train/val)
-- Tokenize for GPT-2 exactly like the docs (EOT + encode_ordinary + '\n\n' quirk)
-- Write .bin using data_common.write_datafile (has the required header)
+- Build "Post/Task/Answer" examples (RAM)
+- Shuffle + split
+- Tokenize for GPT-2 exactly like llm.c docs (EOT + encode_ordinary + '\n\n' quirk)
+- Write *.gpt2.bin using data_common.write_datafile (adds the required header)
 
 Outputs:
-  <train-out>.gpt2.bin
-  <val-out>.gpt2.bin
+  dataset/data/training_data.gpt2.bin
+  dataset/data/validation_data.gpt2.bin
 """
 
-import os, re, csv, argparse, hashlib, random, math, sys
+import os, sys, re, csv, math, argparse, hashlib, random
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tiktoken
 
-# make sure we can import data_common from repo root
+# --------------------------------------------------------------------------------------
+# Robust import of write_datafile from llm.c repo
+# --------------------------------------------------------------------------------------
 HERE = Path(__file__).resolve().parent
-if (HERE / "data_common.py").exists():
-    sys.path.insert(0, str(HERE))
-from data_common import write_datafile  # provided by llm.c repo
+CANDIDATES = [
+    HERE,                     # repo root
+    HERE / "data",            # llm.c/data/data_common.py (usual location)
+]
+for cand in CANDIDATES:
+    if (cand / "data_common.py").exists():
+        sys.path.insert(0, str(cand))
+        break
+
+try:
+    from data_common import write_datafile  # provided by llm.c repo
+except Exception as e:
+    raise SystemExit(
+        "Could not import write_datafile from data_common.py.\n"
+        "Put this script in the llm.c repo root and make sure data/data_common.py exists.\n"
+        f"Details: {e}"
+    )
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-# ---------------------------
+# --------------------------------------------------------------------------------------
 # CLI
-# ---------------------------
+# --------------------------------------------------------------------------------------
 def build_argparser():
     p = argparse.ArgumentParser(
-        description="ADHD-only trial → GPT-2 tokenized .bin for llm.c (with header via write_datafile)."
+        description="ADHD-only trial → GPT-2 tokenized .bin for llm.c (with header)."
     )
     p.add_argument("--train-out", type=str, default="dataset/data/training_data.gpt2.bin")
     p.add_argument("--val-out",   type=str, default="dataset/data/validation_data.gpt2.bin")
@@ -40,14 +56,14 @@ def build_argparser():
 
     cpu = os.cpu_count() or 8
     p.add_argument("--workers",     type=int, default=min(16, cpu), help="Threads for CSV parsing / row processing.")
-    p.add_argument("--tok-workers", type=int, default=min(24, max(2, cpu-4)), help="Threads for tokenization.")
-    p.add_argument("--max-examples", type=int, default=300_000,
-                   help="Global cap for examples to keep RAM in check (0 = no cap).")
+    p.add_argument("--tok-workers", type=int, default=min(24, max(2, cpu - 4)), help="Threads for tokenization.")
+    p.add_argument("--max-examples", type=int, default=200_000,
+                   help="Cap examples to stay within RAM. Set 0 for all.")
     return p
 
-# ---------------------------
-# Light cleaning (keep it mild; don’t damage semantics)
-# ---------------------------
+# --------------------------------------------------------------------------------------
+# Light cleaning (keep semantics)
+# --------------------------------------------------------------------------------------
 _URL_RE      = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
 _EMAIL_RE    = re.compile(r'\b[\w\.-]+@[\w\.-]+\.\w+\b')
 _MENTION_RE  = re.compile(r'@\w+')
@@ -75,9 +91,9 @@ def clean_text(x: str) -> str:
     x = _MULTI_WS_RE.sub(" ", x).strip()
     return x
 
-# ---------------------------
+# --------------------------------------------------------------------------------------
 # Kaggle helper
-# ---------------------------
+# --------------------------------------------------------------------------------------
 def kaggle_download(slug: str, dest: Path):
     if dest.exists() and any(dest.iterdir()):
         print(f"[+] {slug} already in {dest}")
@@ -88,9 +104,9 @@ def kaggle_download(slug: str, dest: Path):
     if code != 0:
         raise RuntimeError(f"Failed to download {slug}. Check Kaggle CLI & credentials.")
 
-# ---------------------------
+# --------------------------------------------------------------------------------------
 # CSV reader
-# ---------------------------
+# --------------------------------------------------------------------------------------
 def read_csv_any(path: Path):
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as f:
@@ -104,9 +120,9 @@ def read_csv_any(path: Path):
         with path.open("r", encoding="utf-8", errors="ignore") as f:
             return list(csv.DictReader(f))
 
-# ---------------------------
+# --------------------------------------------------------------------------------------
 # Build ADHD supervision examples
-# ---------------------------
+# --------------------------------------------------------------------------------------
 def build_adhd_examples(workers: int, max_examples: int) -> list[str]:
     slug = "jerseyneo/reddit-adhd-dataset"
     root = Path("data_cache/reddit_adhd_dataset")
@@ -162,27 +178,27 @@ def build_adhd_examples(workers: int, max_examples: int) -> list[str]:
     print(f"[build] ADHD examples: {len(out):,}")
     return out
 
-# ---------------------------
-# GPT-2 tokenization (docs-accurate) and writing via data_common
-# ---------------------------
+# --------------------------------------------------------------------------------------
+# GPT-2 tokenization (exactly like docs) and write with header
+# --------------------------------------------------------------------------------------
 def tokenize_gpt2_docs_style(sections: list[str], workers: int) -> list[int]:
     """
-    EXACT docs behavior:
-      enc = tiktoken.get_encoding("gpt2")
-      eot = enc._special_tokens['<|endoftext|>']
-      tokens = []
-      for i, s in enumerate(sections):
-          tokens.append(eot)
-          spad = s + "\\n\\n" if i != len(sections) - 1 else s
-          tokens.extend(enc.encode_ordinary(spad))
+    Docs behavior:
+        enc = tiktoken.get_encoding("gpt2")
+        eot = enc._special_tokens['<|endoftext|>']
+        tokens = []
+        for i, s in enumerate(sections):
+            tokens.append(eot)
+            spad = s + "\\n\\n" if i != len(sections) - 1 else s
+            tokens.extend(enc.encode_ordinary(spad))
     """
     enc = tiktoken.get_encoding("gpt2")
     eot_id = enc._special_tokens['<|endoftext|>']
 
     n = len(sections)
-    if n == 0: return []
+    if n == 0:
+        return []
 
-    # split ranges to keep order deterministic
     parts = max(1, workers)
     step = math.ceil(n / parts)
     ranges = [(i, min(i+step, n)) for i in range(0, n, step)]
@@ -204,15 +220,14 @@ def tokenize_gpt2_docs_style(sections: list[str], workers: int) -> list[int]:
         for idx, fut in futs:
             out_parts[idx] = fut.result()
 
-    # flatten preserving order
     tokens = []
     for part in out_parts:
         tokens.extend(part)
     return tokens
 
-# ---------------------------
+# --------------------------------------------------------------------------------------
 # MAIN
-# ---------------------------
+# --------------------------------------------------------------------------------------
 def main():
     ap = build_argparser()
     args = ap.parse_args()
